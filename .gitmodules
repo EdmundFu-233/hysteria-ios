@@ -1,0 +1,6 @@
+[submodule "vendor/go-tun2socks"]
+	path = vendor/go-tun2socks
+	url = https://github.com/eycorsican/go-tun2socks.git
+[submodule "vendor/hysteria"]
+	path = vendor/hysteria
+	url = https://github.com/HyNetwork/hysteria.git

@@ -1,0 +1,63 @@
+# ======================
+# macOS 系统文件
+# ======================
+
+# Finder 缓存文件
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Icon?
+Icon
+
+# Spotlight 索引
+.Spotlight-V100
+
+# Time Machine 本地快照
+.local
+
+# Trash
+.Trashes
+
+# 文件系统事件数据库
+.fseventsd
+
+# 临时锁文件
+*.swp
+
+# ======================
+# Xcode / CocoaPods（如果你在做 iOS/mac 项目，可选）
+# ======================
+
+# Xcode
+build/
+DerivedData/
+*.xcworkspace
+!default.xcworkspace
+*.xcuserdata
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+
+# CocoaPods
+Pods/
+Podfile.lock
+
+# Carthage
+Carthage/Build/
+
+# fastlane
+fastlane/report.xml
+fastlane/Preview.html
+.fastlane/
+
+# ======================
+# 通用可选项
+# ======================
+
+# 日志
+*.log
+
+# 环境配置文件（如果你用 .env 存秘钥）
+.env
+
