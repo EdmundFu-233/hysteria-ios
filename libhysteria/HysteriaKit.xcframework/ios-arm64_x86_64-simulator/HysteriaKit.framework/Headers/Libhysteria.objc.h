@@ -17,37 +17,16 @@
 @class LibhysteriaJSONConfig;
 @class LibhysteriaJSONTLSConfig;
 
-/**
- * API 是暴露给 Swift 的唯一入口点。
- */
 @interface LibhysteriaAPI : NSObject <goSeqRefInterface> {
 }
 @property(strong, readonly) _Nonnull id _ref;
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
-/**
- * NewAPI 创建并返回一个 API 实例。
- */
 - (nullable instancetype)init;
-/**
- * PollLogs 拉取所有当前缓冲的日志，以换行符分隔。
- */
 - (NSString* _Nonnull)pollLogs;
-/**
- * ReadTunPacket 从 Hysteria 读取一个 TUN 数据包。
- */
 - (NSData* _Nullable)readTunPacket:(NSError* _Nullable* _Nullable)error;
-/**
- * Start 启动 Hysteria 客户端。
- */
 - (BOOL)start:(NSString* _Nullable)jsonCfg error:(NSError* _Nullable* _Nullable)error;
-/**
- * Stop 停止 Hysteria 客户端。
- */
 - (void)stop;
-/**
- * WriteTunPacket 将来自 TUN 的数据包写入 Hysteria。
- */
 - (BOOL)writeTunPacket:(NSData* _Nullable)pkt error:(NSError* _Nullable* _Nullable)error;
 @end
 
@@ -57,23 +36,11 @@
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
 - (nonnull instancetype)init;
-/**
- * Close 优先关闭 tunDevice，然后关闭 Hysteria 客户端
- */
 - (BOOL)close:(NSError* _Nullable* _Nullable)error;
-/**
- * ReadToTun 由 Swift 调用，从下行通道拉一个 IP 包返回给 iOS TUN
- */
 - (BOOL)readToTun:(NSData* _Nullable)out_ ret0_:(long* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
-/**
- * WriteFromTun 由 Swift 调用，将来自 iOS TUN 的 IP 包写入上行通道
- */
-- (BOOL)writeFromTun:(NSData* _Nullable)pkt error:(NSError* _Nullable* _Nullable)error;
+- (BOOL)writeFromTun:(NSData* _Nullable)p0 error:(NSError* _Nullable* _Nullable)error;
 @end
 
-/**
- * InboundUDPPacket 用于在 Go 内部传递入站的 UDP 包
- */
 @interface LibhysteriaInboundUDPPacket : NSObject <goSeqRefInterface> {
 }
 @property(strong, readonly) _Nonnull id _ref;
@@ -108,9 +75,6 @@
 @property (nonatomic) NSString* _Nonnull sni;
 @end
 
-/**
- * NewAPI 创建并返回一个 API 实例。
- */
 FOUNDATION_EXPORT LibhysteriaAPI* _Nullable LibhysteriaNewAPI(void);
 
 #endif

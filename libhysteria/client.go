@@ -8,6 +8,8 @@ import (
 	"github.com/apernet/hysteria/extras/v2/obfs"
 )
 
+/* ---------- JSON ---------- */
+
 type JSONTLSConfig struct {
 	SNI string `json:"sni,omitempty"`
 }
@@ -20,7 +22,8 @@ type JSONConfig struct {
 	TLS      JSONTLSConfig `json:"tls,omitempty"`
 }
 
-// InboundUDPPacket 用于在 Go 内部传递入站的 UDP 包
+/* ---------- 桥 ---------- */
+
 type InboundUDPPacket struct {
 	Data    []byte
 	SrcAddr *net.UDPAddr
@@ -32,25 +35,24 @@ type ClientBridge struct {
 	inboundUDPQ chan *InboundUDPPacket
 }
 
+/* ---------- 构造 ---------- */
+
 func newClientBridge(raw string) (*ClientBridge, error) {
 	var jc JSONConfig
 	if err := json.Unmarshal([]byte(raw), &jc); err != nil {
-		goLogger(2, "[Go] JSON unmarshal failed: "+err.Error())
 		return nil, err
 	}
-	goLogger(0, "[Go] Parsed SNI from config: "+jc.TLS.SNI)
 
 	cfg := &hy.Config{
 		Auth:     jc.Auth,
 		FastOpen: jc.FastOpen,
 		TLSConfig: hy.TLSConfig{
-			ServerName: jc.TLS.SNI,
+			ServerName: chooseSNI(jc.TLS.SNI, jc.Server), // ← 自动回退 SNI
 		},
 	}
 
 	rAddr, err := net.ResolveUDPAddr("udp", jc.Server)
 	if err != nil {
-		// goLogger(2, "[Go] ResolveUDPAddr failed: "+err.Error())
 		return nil, err
 	}
 	cfg.ServerAddr = rAddr
@@ -59,7 +61,6 @@ func newClientBridge(raw string) (*ClientBridge, error) {
 	if jc.PSK != "" {
 		ob, err := obfs.NewSalamanderObfuscator([]byte(jc.PSK))
 		if err != nil {
-			// goLogger(2, "[Go] NewSalamanderObfuscator failed: "+err.Error())
 			return nil, err
 		}
 		connFactory = &obfsFactory{Obfs: ob}
@@ -72,7 +73,6 @@ func newClientBridge(raw string) (*ClientBridge, error) {
 		true,
 	)
 	if err != nil {
-		// goLogger(2, "[Go] NewReconnectableClient failed: "+err.Error())
 		return nil, err
 	}
 
@@ -83,39 +83,32 @@ func newClientBridge(raw string) (*ClientBridge, error) {
 
 	if udpConn, err := rc.UDP(); err == nil {
 		cb.udp = udpConn
-		// 启动 UDP 读取器，它会将收到的包放入 inboundUDPQ
 		go cb.udpReader()
-	} else {
-		// goLogger(2, "[Go] Failed to enable UDP: "+err.Error())
 	}
 	return cb, nil
 }
 
-// udpReader 从 Hysteria 连接读取入站 UDP 包，并将其放入队列
+/* ---------- UDP Reader ---------- */
+
 func (c *ClientBridge) udpReader() {
 	for {
 		data, srcAddrStr, err := c.udp.Receive()
 		if err != nil {
-			// goLogger(2, "[Go] udp.Receive() error: "+err.Error())
 			close(c.inboundUDPQ)
 			return
 		}
 		srcAddr, err := net.ResolveUDPAddr("udp", srcAddrStr)
 		if err != nil {
-			// goLogger(2, "[Go] ResolveUDPAddr for inbound packet failed: "+err.Error())
 			continue
 		}
-		pkt := &InboundUDPPacket{
-			Data:    data,
-			SrcAddr: srcAddr,
-		}
 		select {
-		case c.inboundUDPQ <- pkt:
+		case c.inboundUDPQ <- &InboundUDPPacket{Data: data, SrcAddr: srcAddr}:
 		default:
-			// 队列满，丢弃包
 		}
 	}
 }
+
+/* ---------- 连接工厂 ---------- */
 
 type udpConnFactory struct{}
 
@@ -123,9 +116,7 @@ func (u *udpConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	return net.ListenUDP("udp", nil)
 }
 
-type obfsFactory struct {
-	Obfs obfs.Obfuscator
-}
+type obfsFactory struct{ Obfs obfs.Obfuscator }
 
 func (f *obfsFactory) New(addr net.Addr) (net.PacketConn, error) {
 	p, err := net.ListenUDP("udp", nil)
@@ -133,4 +124,14 @@ func (f *obfsFactory) New(addr net.Addr) (net.PacketConn, error) {
 		return nil, err
 	}
 	return obfs.WrapPacketConn(p, f.Obfs), nil
+}
+
+/* ---------- helper: 自动 SNI ---------- */
+
+func chooseSNI(sni, server string) string {
+	if sni != "" {
+		return sni
+	}
+	host, _, _ := net.SplitHostPort(server)
+	return host
 }
