@@ -1,4 +1,4 @@
-// libhysteria/packetio.go
+// libhysteria/packetio.go (已修正)
 package libhysteria
 
 import (
@@ -10,90 +10,66 @@ import (
 	"github.com/eycorsican/go-tun2socks/core"
 )
 
-// 全局只初始化一次
 var (
 	initOnce sync.Once
 	tunDev   *tunDevice
 )
 
-// initPacketIO 第一次调用时完成：
-// 1. newTunDevice()
-// 2. core.NewLWIPStack()
-// 3. core.RegisterOutputFn / core.RegisterTCPConnHandler / core.RegisterUDPConnHandler
-// 4. 一条 goroutine 处理 tunDev.inChan → stack.Write()
 func initPacketIO(cli *ClientBridge) {
 	initOnce.Do(func() {
-		// 1. 创建一个虚拟 TUN 设备
 		tunDev = newTunDevice()
-
-		// 2. 创建并启动 lwIP 栈
 		stack := core.NewLWIPStack()
 
-		// 3. 注册“下行包输出”回调：lwIP 生成一个下行 IP 包，会调用此处，把 data 推入 tunDev.outChan
+		// 下行: lwIP 生成的包 -> tunDev.outChan -> Swift
 		core.RegisterOutputFn(func(data []byte) (int, error) {
-			select {
-			case tunDev.outChan <- data:
-				return len(data), nil
-			case <-tunDev.closeCh:
-				return 0, errors.New("tun device closed")
+			err := tunDev.WriteToOutChan(data)
+			if err != nil {
+				return 0, err
 			}
+			return len(data), nil
 		})
 
-		// 4. 注册 TCP 连接回调：当 lwIP 要发起 TCP 连接时，调用 tcpHandler.Handle 去用 Hysteria 建立到目标的连接
+		// 注册有状态的 TCP 和 UDP 处理器
 		core.RegisterTCPConnHandler(&tcpHandler{cli: cli})
+		udpHandler := newUDPHandler(cli)
+		core.RegisterUDPConnHandler(udpHandler)
 
-		// 5. 注册 UDP 连接回调：当 lwIP 要发起 UDP 连接或发送 UDP 数据时，调用 udpHandler.Connect/ReceiveTo
-		core.RegisterUDPConnHandler(&udpHandler{cli: cli})
+		// 启动 UDP 处理器的主循环，处理来自 Hysteria 的入站包
+		go udpHandler.processInbound()
 
-		// 6. 上行循环：不停地从 tunDev.inChan 取“来自 iOS TUN 的 IP 包”，调用 stack.Write(pkt) 注入到 lwIP
+		// 上行: Swift/TUN -> tunDev.inChan -> lwIP
 		go func() {
 			for {
-				select {
-				case <-tunDev.closeCh:
-					return
-				default:
-					pkt, err := tunDev.ReadPacket()
-					if err != nil {
-						return
-					}
-					_, _ = stack.Write(pkt)
+				pkt, err := tunDev.ReadFromInChan()
+				if err != nil {
+					return // tunDev closed
 				}
+				_, _ = stack.Write(pkt)
 			}
 		}()
-
-		// 注：lwIP 的定时器已经在 NewLWIPStack() 内部启动
 	})
 }
 
-// WriteFromTun 将“来自 iOS TUN 的 IP 包”写给 lwIP
+// WriteFromTun 由 Swift 调用，将来自 iOS TUN 的 IP 包写入上行通道
 func (c *ClientBridge) WriteFromTun(pkt []byte) error {
 	initPacketIO(c)
-
 	buf := make([]byte, len(pkt))
 	copy(buf, pkt)
-
-	select {
-	case tunDev.inChan <- buf:
-		return nil
-	case <-tunDev.closeCh:
-		return errors.New("tun device closed")
-	}
+	return tunDev.WriteToInChan(buf)
 }
 
-// ReadToTun 从 tunDev.outChan 拉一个下行 IP 包，返回给 iOS TUN
+// ReadToTun 由 Swift 调用，从下行通道拉一个 IP 包返回给 iOS TUN
 func (c *ClientBridge) ReadToTun(out []byte) (int, error) {
 	initPacketIO(c)
-
-	select {
-	case pkt := <-tunDev.outChan:
-		if len(pkt) > len(out) {
-			return 0, errors.New("output buffer too small")
-		}
-		copy(out, pkt)
-		return len(pkt), nil
-	case <-tunDev.closeCh:
-		return 0, errors.New("tun device closed")
+	pkt, err := tunDev.ReadFromOutChan()
+	if err != nil {
+		return 0, err
 	}
+	if len(pkt) > len(out) {
+		return 0, errors.New("output buffer too small")
+	}
+	copy(out, pkt)
+	return len(pkt), nil
 }
 
 // Close 优先关闭 tunDevice，然后关闭 Hysteria 客户端
@@ -104,96 +80,108 @@ func (c *ClientBridge) Close() error {
 	return c.cl.Close()
 }
 
-//
-// —— TCP 处理 Handler ——
-//
-
-// tcpHandler 实现 core.TCPConnHandler
+// --- TCP Handler (保持不变) ---
 type tcpHandler struct {
 	cli *ClientBridge
 }
 
-// Handle 当 lwIP 内部想与目标服务器 (target *net.TCPAddr) 建立 TCP 连接时被调用
 func (h *tcpHandler) Handle(conn net.Conn, target *net.TCPAddr) error {
 	hostPort := net.JoinHostPort(target.IP.String(), strconv.Itoa(target.Port))
 	hyConn, err := h.cli.cl.TCP(hostPort)
 	if err != nil {
+		_ = conn.Close()
 		return err
 	}
-
-	// lwIP → Hysteria
 	go func() {
-		buf := make([]byte, 65535)
+		defer conn.Close()
+		defer hyConn.Close()
+		buf := make([]byte, 4096)
 		for {
 			n, err := conn.Read(buf)
 			if err != nil {
-				_ = conn.Close()
 				return
 			}
 			if n > 0 {
-				_, _ = hyConn.Write(buf[:n])
+				_, err = hyConn.Write(buf[:n])
+				if err != nil {
+					return
+				}
 			}
 		}
 	}()
-
-	// Hysteria → lwIP
 	go func() {
-		buf := make([]byte, 65535)
+		defer conn.Close()
+		defer hyConn.Close()
+		buf := make([]byte, 4096)
 		for {
 			n, err := hyConn.Read(buf)
 			if err != nil {
-				_ = conn.Close()
 				return
 			}
 			if n > 0 {
-				_, _ = conn.Write(buf[:n])
+				_, err = conn.Write(buf[:n])
+				if err != nil {
+					return
+				}
 			}
 		}
 	}()
-
 	return nil
 }
 
-//
-// —— UDP 处理 Handler ——
-//
-
-// udpHandler 实现 core.UDPConnHandler
+// --- UDP Handler (完全重写) ---
 type udpHandler struct {
-	cli *ClientBridge
+	cli   *ClientBridge
+	conns sync.Map // key: targetAddr (string), value: core.UDPConn
 }
 
-// Connect 当 lwIP 需要“打开一个新的 UDP 会话”时调用。
-// target 为 nil 表示只是绑定本地端口，否则表示要与目标 target *net.UDPAddr 通信。
-func (h *udpHandler) Connect(conn core.UDPConn, target *net.UDPAddr) error {
-	if target == nil {
-		// 仅绑定本地端口，lwIP 后续会在 ReceiveTo 中把数据发给 target
-		return nil
-	}
-	hyConn, err := h.cli.cl.UDP()
-	if err != nil {
-		return err
-	}
+func newUDPHandler(cli *ClientBridge) *udpHandler {
+	return &udpHandler{cli: cli}
+}
 
-	// Hysteria → lwIP：远端回包写回给 lwIP
-	go func() {
-		for {
-			data, raddr, err := hyConn.Receive()
-			if err != nil {
-				return
-			}
-			pkt := buildUDPPacket(raddr, data)
-			_, _ = conn.WriteFrom(pkt, nil)
-		}
-	}()
+// Connect 当 lwIP 创建一个新的 UDP "连接" 时被调用
+func (h *udpHandler) Connect(conn core.UDPConn, target *net.UDPAddr) error {
+	// 将这个新的连接存入 map，以便入站时可以找到它
+	h.conns.Store(target.String(), conn)
 	return nil
 }
 
-// ReceiveTo 当 lwIP 想“从 conn 发送 UDP 数据到 target”时调用
+// ReceiveTo 当 App 通过 TUN 发送 UDP 包时被调用 (出站)
 func (h *udpHandler) ReceiveTo(conn core.UDPConn, data []byte, addr *net.UDPAddr) error {
-	hostPort := net.JoinHostPort(addr.IP.String(), strconv.Itoa(addr.Port))
 	if h.cli.udp == nil {
-		return errors.New("UDP not enabled")
+		return errors.New("UDP not enabled on Hysteria client")
 	}
-	return h.cli.udp.Send(data, hostPort)
+	// 将数据包通过 Hysteria 发送到目标地址
+	return h.cli.udp.Send(data, addr.String())
+}
+
+// Close 当 lwIP 关闭一个 UDP "连接" 时被调用
+func (h *udpHandler) Close(conn core.UDPConn) {
+	// 从 map 中移除，清理资源
+	h.conns.Range(func(key, value interface{}) bool {
+		if value == conn {
+			h.conns.Delete(key)
+			return false // stop iteration
+		}
+		return true
+	})
+}
+
+// processInbound 是 UDP 处理器的主循环，处理来自 Hysteria 的入站包
+func (h *udpHandler) processInbound() {
+	for pkt := range h.cli.inboundUDPQ {
+		// pkt.SrcAddr 是远端服务器地址，例如 "1.1.1.1:53"
+		// 我们需要根据这个地址找到对应的 lwIP 连接
+		val, ok := h.conns.Load(pkt.SrcAddr.String())
+		if !ok {
+			// 找不到对应的连接，可能已经关闭，丢弃
+			continue
+		}
+		conn := val.(core.UDPConn)
+		// 将收到的数据注入回 lwIP，lwIP 会处理并将其发送给正确的 App
+		_, err := conn.WriteFrom(pkt.Data, pkt.SrcAddr)
+		if err != nil {
+			goLogger(2, "[Go] udpHandler WriteFrom failed: "+err.Error())
+		}
+	}
 }
