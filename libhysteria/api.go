@@ -50,13 +50,18 @@ func (a *API) PollLogs() string {
 	}
 }
 
+// --- 核心修改: Start 现在是非阻塞的，在后台启动连接 ---
 func (a *API) Start(jsonCfg string) error {
-	goLogger(0, "API.Start")
+	goLogger(0, "API.Start called")
 	cb, err := newClientBridge(jsonCfg)
 	if err != nil {
 		goLogger(2, "newClientBridge failed: "+err.Error())
 		return err
 	}
+
+	// 启动一个 goroutine 在后台进行实际的连接
+	go cb.Connect()
+
 	cliMu.Lock()
 	if cli != nil {
 		_ = cli.Close()
@@ -64,6 +69,16 @@ func (a *API) Start(jsonCfg string) error {
 	cli = cb
 	cliMu.Unlock()
 	return nil
+}
+
+// --- 新增: 获取客户端状态的方法 ---
+func (a *API) GetState() string {
+	cliMu.RLock()
+	defer cliMu.RUnlock()
+	if cli == nil {
+		return "stopped"
+	}
+	return cli.GetState()
 }
 
 func (a *API) Stop() {
