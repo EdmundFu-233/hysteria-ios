@@ -25,15 +25,9 @@
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
 - (nullable instancetype)init;
-/**
- * --- 新增: 获取客户端状态的方法 ---
- */
 - (NSString* _Nonnull)getState;
 - (NSString* _Nonnull)pollLogs;
 - (NSData* _Nullable)readTunPacket:(NSError* _Nullable* _Nullable)error;
-/**
- * --- 核心修改: Start 现在是非阻塞的，在后台启动连接 ---
- */
 - (BOOL)start:(NSString* _Nullable)jsonCfg error:(NSError* _Nullable* _Nullable)error;
 - (void)stop;
 - (BOOL)writeTunPacket:(NSData* _Nullable)pkt error:(NSError* _Nullable* _Nullable)error;
@@ -45,14 +39,11 @@
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
 - (nonnull instancetype)init;
+/**
+ * Close 方法更加健壮
+ */
 - (BOOL)close:(NSError* _Nullable* _Nullable)error;
-/**
- * Connect 方法在后台 goroutine 中执行，它包含阻塞式的连接逻辑
- */
 - (void)connect;
-/**
- * GetState 原子地读取当前连接状态
- */
 - (NSString* _Nonnull)getState;
 - (BOOL)readToTun:(NSData* _Nullable)out_ ret0_:(long* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
 - (BOOL)writeFromTun:(NSData* _Nullable)p0 error:(NSError* _Nullable* _Nullable)error;

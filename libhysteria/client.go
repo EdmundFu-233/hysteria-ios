@@ -1,17 +1,20 @@
+// client.go
+
 package libhysteria
 
 import (
 	"encoding/json"
 	"net"
-	"strconv"     // 确保导入 strconv
-	"sync/atomic" // 确保导入 atomic
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	hy "github.com/apernet/hysteria/core/v2/client"
 	"github.com/apernet/hysteria/extras/v2/obfs"
 )
 
-/* ---------- JSON 结构体定义 ---------- */
-// 这些结构体与 Swift 端构建的 JSON 配置完全对应
+/* ---------- JSON 结构体定义 (保持不变) ---------- */
 
 type JSONTLSConfig struct {
 	SNI string `json:"sni,omitempty"`
@@ -41,7 +44,7 @@ type JSONConfig struct {
 	ALPN      string              `json:"alpn,omitempty"`
 }
 
-/* ---------- 桥接核心结构体 ---------- */
+/* ---------- 桥接核心结构体 (保持不变) ---------- */
 
 type InboundUDPPacket struct {
 	Data    []byte
@@ -54,12 +57,11 @@ type ClientBridge struct {
 	inboundUDPQ chan *InboundUDPPacket
 	tunConfig   JSONTunConfig
 	rawConfig   string
-	state       atomic.Value // 安全地在 goroutine 之间共享状态
+	state       atomic.Value
 }
 
-/* ---------- 构造与连接 ---------- */
+/* ---------- 构造与连接 (已修复) ---------- */
 
-// newClientBridge 仅执行最轻量的初始化，并将状态设置为 "connecting"
 func newClientBridge(raw string) (*ClientBridge, error) {
 	cb := &ClientBridge{
 		inboundUDPQ: make(chan *InboundUDPPacket, 4096),
@@ -69,7 +71,38 @@ func newClientBridge(raw string) (*ClientBridge, error) {
 	return cb, nil
 }
 
-// Connect 方法在后台 goroutine 中执行，它包含阻塞式的连接逻辑
+func parseBandwidth(s string) uint64 {
+	s = strings.ToLower(strings.TrimSpace(s))
+	var multiplier uint64 = 1
+	if strings.HasSuffix(s, "kbps") {
+		multiplier = 1000 / 8
+		s = strings.TrimSuffix(s, "kbps")
+	} else if strings.HasSuffix(s, "mbps") {
+		multiplier = 1000 * 1000 / 8
+		s = strings.TrimSuffix(s, "mbps")
+	} else if strings.HasSuffix(s, "gbps") {
+		multiplier = 1000 * 1000 * 1000 / 8
+		s = strings.TrimSuffix(s, "gbps")
+	} else if strings.HasSuffix(s, "k") || strings.HasSuffix(s, "kb") {
+		multiplier = 1024
+		s = strings.TrimSuffix(s, "k")
+		s = strings.TrimSuffix(s, "b")
+	} else if strings.HasSuffix(s, "m") || strings.HasSuffix(s, "mb") {
+		multiplier = 1024 * 1024
+		s = strings.TrimSuffix(s, "m")
+		s = strings.TrimSuffix(s, "b")
+	} else if strings.HasSuffix(s, "g") || strings.HasSuffix(s, "gb") {
+		multiplier = 1024 * 1024 * 1024
+		s = strings.TrimSuffix(s, "g")
+		s = strings.TrimSuffix(s, "b")
+	}
+	val, err := strconv.ParseUint(strings.TrimSpace(s), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return val * multiplier
+}
+
 func (c *ClientBridge) Connect() {
 	goLogger(0, "Bridge.Connect: Starting blocking connection process...")
 	var jc JSONConfig
@@ -98,9 +131,10 @@ func (c *ClientBridge) Connect() {
 		connFactory = &obfsFactory{Obfs: ob}
 	}
 
-	// 使用 hy.Config 来配置 NewClient
-	// 注意：Hysteria v2 的 core client 不直接处理带宽字符串，这通常在应用层处理。
-	// 我们在这里保持配置完整性，但 core client 会忽略它。
+	bwUp := parseBandwidth(jc.Bandwidth.Up)
+	bwDown := parseBandwidth(jc.Bandwidth.Down)
+	goLogger(0, "Parsed bandwidth: Up="+strconv.FormatUint(bwUp, 10)+" Bps, Down="+strconv.FormatUint(bwDown, 10)+" Bps")
+
 	cfg := &hy.Config{
 		ConnFactory: connFactory,
 		ServerAddr:  rAddr,
@@ -108,73 +142,98 @@ func (c *ClientBridge) Connect() {
 		TLSConfig: hy.TLSConfig{
 			ServerName: chooseSNI(jc.TLS.SNI, jc.Server),
 		},
+		BandwidthConfig: hy.BandwidthConfig{
+			MaxTx: bwUp,
+			MaxRx: bwDown,
+		},
+		QUICConfig: hy.QUICConfig{
+			MaxIdleTimeout:  30 * time.Second,
+			KeepAlivePeriod: 10 * time.Second,
+		},
 		FastOpen: jc.FastOpen,
-		// QUICConfig 等其他字段可以使用默认值
 	}
 
-	// hy.NewClient 是一个阻塞式调用，它会完成握手
 	client, handshakeInfo, err := hy.NewClient(cfg)
 	if err != nil {
 		goLogger(2, "Connect: hy.NewClient failed: "+err.Error())
 		c.state.Store("failed: " + err.Error())
 		return
 	}
-
-	goLogger(0, "Bridge.Connect: hy.NewClient successful. Handshake Info: UDPEnabled="+strconv.FormatBool(handshakeInfo.UDPEnabled))
+	goLogger(0, "Bridge.Connect: Control plane connected. Handshake Info: UDPEnabled="+strconv.FormatBool(handshakeInfo.UDPEnabled))
 	c.cl = client
 
+	goLogger(0, "Bridge.Connect: Warming up data path by dialing 1.1.1.1:53...")
+	testConn, err := client.TCP("1.1.1.1:53")
+	if err != nil {
+		goLogger(2, "Connect: Data path warm-up failed at client.TCP(): "+err.Error())
+		c.state.Store("failed: data path warm-up error")
+		_ = client.Close()
+		return
+	}
+	_ = testConn.Close()
+	goLogger(0, "Bridge.Connect: Data path warm-up successful.")
+
+	// --- 核心修复 ---
+	// 严格处理 UDP 会话建立
 	if handshakeInfo.UDPEnabled {
+		goLogger(0, "Bridge.Connect: UDP is enabled by server, setting up UDP session...")
 		udpConn, err := client.UDP()
 		if err != nil {
+			// 如果服务器说支持UDP，但我们无法建立UDP会话，这是一个致命错误
 			goLogger(2, "Connect: client.UDP() failed: "+err.Error())
-			// UDP 失败不一定是致命错误，但需要记录
-		} else {
-			c.udp = udpConn
-			go c.udpReader()
+			c.state.Store("failed: udp setup error")
+			_ = client.Close()
+			return // 中止连接过程
 		}
+		goLogger(0, "Bridge.Connect: UDP session created successfully.")
+		c.udp = udpConn
+		go c.udpReader()
+	} else {
+		goLogger(0, "Bridge.Connect: UDP is not enabled by server, will run in TCP-only mode.")
+		// 确保 inboundUDPQ 被关闭，以防止下游的 goroutine 永久阻塞
+		close(c.inboundUDPQ)
 	}
 
-	goLogger(0, "Bridge.Connect: Hysteria client truly connected.")
+	goLogger(0, "Bridge.Connect: Hysteria client is fully connected and data path is ready.")
 	c.state.Store("connected")
 }
 
-// GetState 原子地读取当前连接状态
 func (c *ClientBridge) GetState() string {
 	return c.state.Load().(string)
 }
 
-/* ---------- UDP Reader & 其他辅助函数 ---------- */
+/* ---------- UDP Reader & 其他辅助函数 (已修复) ---------- */
 
-// udpReader 从 Hysteria 客户端读取 UDP 包并放入队列
 func (c *ClientBridge) udpReader() {
+	// 当这个 goroutine 退出时（例如，连接断开），关闭通道
+	// 这会通知消费者（udpHandler.loop）没有更多的数据了
+	defer close(c.inboundUDPQ)
 	for {
 		data, srcAddrStr, err := c.udp.Receive()
 		if err != nil {
-			// 连接关闭时会出错，这是正常的退出路径
 			goLogger(1, "udpReader closing: "+err.Error())
-			close(c.inboundUDPQ)
-			return
+			return // 退出循环, defer 将被执行
 		}
 		srcAddr, err := net.ResolveUDPAddr("udp", srcAddrStr)
 		if err != nil {
-			continue // 忽略无法解析的源地址
+			continue
 		}
 		select {
 		case c.inboundUDPQ <- &InboundUDPPacket{Data: data, SrcAddr: srcAddr}:
 		default:
-			// 如果队列满了，丢弃数据包以防阻塞
+			// 如果通道满了，丢弃数据包以避免阻塞
+			goLogger(1, "udpReader: inbound UDP queue full, dropping packet.")
 		}
 	}
 }
 
-// udpConnFactory 是 Hysteria 的标准 UDP 连接工厂
+// udpConnFactory, obfsFactory, chooseSNI 保持不变
 type udpConnFactory struct{}
 
 func (u *udpConnFactory) New(addr net.Addr) (net.PacketConn, error) {
 	return net.ListenUDP("udp", nil)
 }
 
-// obfsFactory 是用于混淆的连接工厂
 type obfsFactory struct{ Obfs obfs.Obfuscator }
 
 func (f *obfsFactory) New(addr net.Addr) (net.PacketConn, error) {
@@ -185,14 +244,12 @@ func (f *obfsFactory) New(addr net.Addr) (net.PacketConn, error) {
 	return obfs.WrapPacketConn(p, f.Obfs), nil
 }
 
-// chooseSNI 根据配置或服务器地址选择 SNI
 func chooseSNI(sni, server string) string {
 	if sni != "" {
 		return sni
 	}
 	host, _, err := net.SplitHostPort(server)
 	if err != nil {
-		// 如果 server 不含端口（虽然不规范），直接使用它
 		return server
 	}
 	return host
