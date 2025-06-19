@@ -24,12 +24,18 @@
 @property(strong, readonly) _Nonnull id _ref;
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
+/**
+ * NewAPI (严格遵循您提供的版本)
+ */
 - (nullable instancetype)init;
 - (NSString* _Nonnull)getState;
 - (NSString* _Nonnull)pollLogs;
 - (NSData* _Nullable)readTunPacket:(NSError* _Nullable* _Nullable)error;
 - (BOOL)start:(NSString* _Nullable)jsonCfg error:(NSError* _Nullable* _Nullable)error;
 - (void)stop;
+/**
+ * ==================== 唯一的修改点 ====================
+ */
 - (BOOL)writeTunPacket:(NSData* _Nullable)pkt error:(NSError* _Nullable* _Nullable)error;
 @end
 
@@ -39,9 +45,6 @@
 
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
 - (nonnull instancetype)init;
-/**
- * Close 方法更加健壮
- */
 - (BOOL)close:(NSError* _Nullable* _Nullable)error;
 - (void)connect;
 - (NSString* _Nonnull)getState;
@@ -114,6 +117,9 @@
 
 @end
 
+/**
+ * NewAPI (严格遵循您提供的版本)
+ */
 FOUNDATION_EXPORT LibhysteriaAPI* _Nullable LibhysteriaNewAPI(void);
 
 #endif

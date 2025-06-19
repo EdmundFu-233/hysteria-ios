@@ -1,9 +1,8 @@
-// client.go
-
 package libhysteria
 
 import (
 	"encoding/json"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -14,7 +13,7 @@ import (
 	"github.com/apernet/hysteria/extras/v2/obfs"
 )
 
-/* ---------- JSON 结构体定义 (保持不变) ---------- */
+/* ---------- JSON 结构体定义 ---------- */
 
 type JSONTLSConfig struct {
 	SNI string `json:"sni,omitempty"`
@@ -44,7 +43,7 @@ type JSONConfig struct {
 	ALPN      string              `json:"alpn,omitempty"`
 }
 
-/* ---------- 桥接核心结构体 (保持不变) ---------- */
+/* ---------- 桥接核心结构体 ---------- */
 
 type InboundUDPPacket struct {
 	Data    []byte
@@ -60,14 +59,16 @@ type ClientBridge struct {
 	state       atomic.Value
 }
 
-/* ---------- 构造与连接 (已修复) ---------- */
+/* ---------- 构造与连接 (with Detailed Logging) ---------- */
 
 func newClientBridge(raw string) (*ClientBridge, error) {
+	goLogger(0, "[ClientBridge] newClientBridge called.")
 	cb := &ClientBridge{
 		inboundUDPQ: make(chan *InboundUDPPacket, 4096),
 		rawConfig:   raw,
 	}
 	cb.state.Store("connecting")
+	goLogger(1, "[ClientBridge] newClientBridge: State set to 'connecting'.")
 	return cb, nil
 }
 
@@ -104,27 +105,31 @@ func parseBandwidth(s string) uint64 {
 }
 
 func (c *ClientBridge) Connect() {
-	goLogger(0, "Bridge.Connect: Starting blocking connection process...")
+	goLogger(0, "[ClientBridge] Connect: Starting connection process in goroutine.")
 	var jc JSONConfig
 	if err := json.Unmarshal([]byte(c.rawConfig), &jc); err != nil {
-		goLogger(2, "Connect: json.Unmarshal failed: "+err.Error())
+		goLogger(2, "[ClientBridge] Connect: json.Unmarshal failed: "+err.Error())
 		c.state.Store("failed: config error")
 		return
 	}
+	goLogger(1, "[ClientBridge] Connect: JSON config parsed successfully.")
 	c.tunConfig = jc.Tun
 
+	goLogger(1, fmt.Sprintf("[ClientBridge] Connect: Resolving UDP address for %s.", jc.Server))
 	rAddr, err := net.ResolveUDPAddr("udp", jc.Server)
 	if err != nil {
-		goLogger(2, "Connect: net.ResolveUDPAddr for '"+jc.Server+"' failed: "+err.Error())
+		goLogger(2, "[ClientBridge] Connect: net.ResolveUDPAddr failed: "+err.Error())
 		c.state.Store("failed: dns error")
 		return
 	}
+	goLogger(1, fmt.Sprintf("[ClientBridge] Connect: Resolved to %s.", rAddr.String()))
 
 	var connFactory hy.ConnFactory = &udpConnFactory{}
 	if jc.PSK != "" {
+		goLogger(1, "[ClientBridge] Connect: PSK found, creating Salamander obfuscator.")
 		ob, err := obfs.NewSalamanderObfuscator([]byte(jc.PSK))
 		if err != nil {
-			goLogger(2, "Connect: NewSalamanderObfuscator failed: "+err.Error())
+			goLogger(2, "[ClientBridge] Connect: NewSalamanderObfuscator failed: "+err.Error())
 			c.state.Store("failed: obfs error")
 			return
 		}
@@ -133,68 +138,57 @@ func (c *ClientBridge) Connect() {
 
 	bwUp := parseBandwidth(jc.Bandwidth.Up)
 	bwDown := parseBandwidth(jc.Bandwidth.Down)
-	goLogger(0, "Parsed bandwidth: Up="+strconv.FormatUint(bwUp, 10)+" Bps, Down="+strconv.FormatUint(bwDown, 10)+" Bps")
+	goLogger(1, fmt.Sprintf("[ClientBridge] Connect: Parsed bandwidth: Up=%d Bps, Down=%d Bps.", bwUp, bwDown))
 
 	cfg := &hy.Config{
-		ConnFactory: connFactory,
-		ServerAddr:  rAddr,
-		Auth:        jc.Auth,
-		TLSConfig: hy.TLSConfig{
-			ServerName: chooseSNI(jc.TLS.SNI, jc.Server),
-		},
-		BandwidthConfig: hy.BandwidthConfig{
-			MaxTx: bwUp,
-			MaxRx: bwDown,
-		},
-		QUICConfig: hy.QUICConfig{
-			MaxIdleTimeout:  30 * time.Second,
-			KeepAlivePeriod: 10 * time.Second,
-		},
-		FastOpen: jc.FastOpen,
+		ConnFactory:     connFactory,
+		ServerAddr:      rAddr,
+		Auth:            jc.Auth,
+		TLSConfig:       hy.TLSConfig{ServerName: chooseSNI(jc.TLS.SNI, jc.Server)},
+		BandwidthConfig: hy.BandwidthConfig{MaxTx: bwUp, MaxRx: bwDown},
+		QUICConfig:      hy.QUICConfig{MaxIdleTimeout: 30 * time.Second, KeepAlivePeriod: 10 * time.Second},
+		FastOpen:        jc.FastOpen,
 	}
 
+	goLogger(1, "[ClientBridge] Connect: Calling hy.NewClient (this may block).")
 	client, handshakeInfo, err := hy.NewClient(cfg)
 	if err != nil {
-		goLogger(2, "Connect: hy.NewClient failed: "+err.Error())
+		goLogger(2, "[ClientBridge] Connect: hy.NewClient failed: "+err.Error())
 		c.state.Store("failed: " + err.Error())
 		return
 	}
-	goLogger(0, "Bridge.Connect: Control plane connected. Handshake Info: UDPEnabled="+strconv.FormatBool(handshakeInfo.UDPEnabled))
+	goLogger(0, fmt.Sprintf("[ClientBridge] Connect: Control plane connected. UDPEnabled: %t.", handshakeInfo.UDPEnabled))
 	c.cl = client
 
-	goLogger(0, "Bridge.Connect: Warming up data path by dialing 1.1.1.1:53...")
+	goLogger(1, "[ClientBridge] Connect: Warming up data path by dialing 1.1.1.1:53.")
 	testConn, err := client.TCP("1.1.1.1:53")
 	if err != nil {
-		goLogger(2, "Connect: Data path warm-up failed at client.TCP(): "+err.Error())
+		goLogger(2, "[ClientBridge] Connect: Data path warm-up failed: "+err.Error())
 		c.state.Store("failed: data path warm-up error")
 		_ = client.Close()
 		return
 	}
 	_ = testConn.Close()
-	goLogger(0, "Bridge.Connect: Data path warm-up successful.")
+	goLogger(1, "[ClientBridge] Connect: Data path warm-up successful.")
 
-	// --- 核心修复 ---
-	// 严格处理 UDP 会话建立
 	if handshakeInfo.UDPEnabled {
-		goLogger(0, "Bridge.Connect: UDP is enabled by server, setting up UDP session...")
+		goLogger(1, "[ClientBridge] Connect: UDP enabled, calling client.UDP().")
 		udpConn, err := client.UDP()
 		if err != nil {
-			// 如果服务器说支持UDP，但我们无法建立UDP会话，这是一个致命错误
-			goLogger(2, "Connect: client.UDP() failed: "+err.Error())
+			goLogger(2, "[ClientBridge] Connect: client.UDP() failed: "+err.Error())
 			c.state.Store("failed: udp setup error")
 			_ = client.Close()
-			return // 中止连接过程
+			return
 		}
-		goLogger(0, "Bridge.Connect: UDP session created successfully.")
+		goLogger(1, "[ClientBridge] Connect: UDP session created. Starting udpReader goroutine.")
 		c.udp = udpConn
 		go c.udpReader()
 	} else {
-		goLogger(0, "Bridge.Connect: UDP is not enabled by server, will run in TCP-only mode.")
-		// 确保 inboundUDPQ 被关闭，以防止下游的 goroutine 永久阻塞
+		goLogger(1, "[ClientBridge] Connect: UDP not enabled by server. Closing inbound UDP queue.")
 		close(c.inboundUDPQ)
 	}
 
-	goLogger(0, "Bridge.Connect: Hysteria client is fully connected and data path is ready.")
+	goLogger(0, "[ClientBridge] Connect: Setup complete. State changed to 'connected'.")
 	c.state.Store("connected")
 }
 
@@ -202,32 +196,38 @@ func (c *ClientBridge) GetState() string {
 	return c.state.Load().(string)
 }
 
-/* ---------- UDP Reader & 其他辅助函数 (已修复) ---------- */
+/* ---------- UDP Reader & 其他辅助函数 (with Detailed Logging) ---------- */
 
 func (c *ClientBridge) udpReader() {
-	// 当这个 goroutine 退出时（例如，连接断开），关闭通道
-	// 这会通知消费者（udpHandler.loop）没有更多的数据了
-	defer close(c.inboundUDPQ)
+	goLogger(1, "[ClientBridge] udpReader: Goroutine started.")
+	defer func() {
+		goLogger(1, "[ClientBridge] udpReader: Closing inbound UDP queue and exiting goroutine.")
+		close(c.inboundUDPQ)
+	}()
 	for {
+		goLogger(1, "[ClientBridge] udpReader: Calling c.udp.Receive() (blocking).")
 		data, srcAddrStr, err := c.udp.Receive()
 		if err != nil {
-			goLogger(1, "udpReader closing: "+err.Error())
-			return // 退出循环, defer 将被执行
+			goLogger(2, "[ClientBridge] udpReader: c.udp.Receive() error: "+err.Error())
+			return
 		}
+		goLogger(1, fmt.Sprintf("[ClientBridge] udpReader: Received %d bytes from %s.", len(data), srcAddrStr))
+
 		srcAddr, err := net.ResolveUDPAddr("udp", srcAddrStr)
 		if err != nil {
+			goLogger(2, fmt.Sprintf("[ClientBridge] udpReader: Failed to resolve source addr %s: %s", srcAddrStr, err.Error()))
 			continue
 		}
+
 		select {
 		case c.inboundUDPQ <- &InboundUDPPacket{Data: data, SrcAddr: srcAddr}:
+			goLogger(1, "[ClientBridge] udpReader: Packet sent to inboundUDPQ.")
 		default:
-			// 如果通道满了，丢弃数据包以避免阻塞
-			goLogger(1, "udpReader: inbound UDP queue full, dropping packet.")
+			goLogger(2, "[ClientBridge] udpReader: inboundUDPQ is full, dropping packet!")
 		}
 	}
 }
 
-// udpConnFactory, obfsFactory, chooseSNI 保持不变
 type udpConnFactory struct{}
 
 func (u *udpConnFactory) New(addr net.Addr) (net.PacketConn, error) {

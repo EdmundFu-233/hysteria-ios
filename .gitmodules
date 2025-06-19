@@ -4,3 +4,6 @@
 [submodule "vendor/hysteria"]
 	path = vendor/hysteria
 	url = https://github.com/HyNetwork/hysteria.git
+[submodule "vendor/tun2socks"]
+	path = vendor/tun2socks
+	url = https://github.com/xjasonlyu/tun2socks.git
