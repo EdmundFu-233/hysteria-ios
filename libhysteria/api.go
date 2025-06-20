@@ -37,6 +37,43 @@ var (
 	cli   *ClientBridge
 )
 
+// [PLAN STEP 1] 新增：用于工作队列模式的全局变量
+var (
+	// 使用 sync.Pool 复用数据包缓冲区，减少GC压力
+	pktPool = sync.Pool{New: func() interface{} {
+		// 预分配 2048 字节，足以容纳大多数MTU
+		b := make([]byte, 2048)
+		return &b
+	}}
+	// 数据包工作队列，限制缓冲大小以控制内存
+	pktQueue = make(chan []byte, 1024)
+	// 确保 writerLoop 只启动一次
+	onceWriter sync.Once
+)
+
+// [PLAN STEP 1] 新增：处理数据包队列的常驻 goroutine
+func writerLoop() {
+	goLogger(0, "[writerLoop] Starting packet writer loop.")
+	for p := range pktQueue {
+		cliMu.RLock()
+		c := cli
+		cliMu.RUnlock()
+
+		if c != nil {
+			err := c.WriteFromTun(p)
+			if err != nil {
+				goLogger(2, fmt.Sprintf("[writerLoop] WriteFromTun failed: %v", err))
+			}
+		}
+		// 将缓冲区放回池中以供复用
+		// 我们需要从池中获取指向字节切片的指针，所以这里需要类型断言
+		ptr := pktPool.Get().(*[]byte)
+		*ptr = (*ptr)[:0] // 重置长度为0，但保留容量
+		pktPool.Put(ptr)
+	}
+	goLogger(0, "[writerLoop] Packet writer loop stopped.")
+}
+
 // NewAPI (严格遵循您提供的版本)
 func NewAPI() *API {
 	if logChan == nil {
@@ -65,156 +102,123 @@ func (a *API) PollLogs() string {
 	}
 }
 
+// [PLAN STEP 1] 修正：在 Start 中启动 writerLoop
 func (a *API) Start(jsonCfg string) error {
-	goLogger(0, "[API] Start called. (User-provided version base)") // 标记一下基于哪个版本
+	goLogger(0, "[API] Start called.")
+
+	// 确保 writerLoop goroutine 已经启动
+	onceWriter.Do(func() {
+		go writerLoop()
+	})
 
 	cliMu.Lock()
 	defer cliMu.Unlock()
 
 	if cli != nil {
-		goLogger(1, "[API] Start: Existing client found, closing it first. (User-provided version base)")
+		goLogger(1, "[API] Start: Existing client found, closing it first.")
 		_ = cli.Close()
 		cli = nil
 	}
 
-	goLogger(1, "[API] Start: Creating new client bridge. (User-provided version base)")
+	goLogger(1, "[API] Start: Creating new client bridge.")
 	cb, err := newClientBridge(jsonCfg)
 	if err != nil {
-		goLogger(2, "[API] Start: newClientBridge failed: "+err.Error()+" (User-provided version base)")
+		goLogger(2, "[API] Start: newClientBridge failed: "+err.Error())
 		return err
 	}
 
 	cli = cb
-	goLogger(1, "[API] Start: New client bridge created. Starting connection in background. (User-provided version base)")
+	goLogger(1, "[API] Start: New client bridge created. Starting connection in background.")
 
 	go cb.Connect()
 
-	goLogger(0, "[API] Start finished. Connection process running in background. (User-provided version base)")
+	goLogger(0, "[API] Start finished. Connection process running in background.")
 	return nil
 }
 
 func (a *API) GetState() string {
-	// goLogger 调用前 logChan 应该已经被 NewAPI 初始化了
 	cliMu.RLock()
 	defer cliMu.RUnlock()
 	if cli == nil {
-		goLogger(1, "[API] GetState: cli is nil, returning 'stopped'. (User-provided version base)")
 		return "stopped"
 	}
-	state := cli.GetState()
-	goLogger(1, fmt.Sprintf("[API] GetState called, returning '%s'. (User-provided version base)", state))
-	return state
+	return cli.GetState()
 }
 
 func (a *API) Stop() {
-	goLogger(0, "[API] Stop called. (User-provided version base)")
+	goLogger(0, "[API] Stop called.")
 	cliMu.Lock()
 	defer cliMu.Unlock()
 	if cli != nil {
-		goLogger(1, "[API] Stop: Client found, calling Close(). (User-provided version base)")
+		goLogger(1, "[API] Stop: Client found, calling Close().")
 		_ = cli.Close()
 		cli = nil
-		goLogger(1, "[API] Stop: Client closed and set to nil. (User-provided version base)")
-	} else {
-		goLogger(1, "[API] Stop: No client to stop. (User-provided version base)")
 	}
 }
 
-// ==================== 唯一的修改点 ====================
+// [PLAN STEP 1] 修正：重构 WriteTunPacket 以使用工作队列
 func (a *API) WriteTunPacket(pkt []byte) error {
-	// 立即将任务派发到新的 goroutine，并快速返回 nil。
-	// 这样可以防止任何下游的锁或IO操作阻塞 gomobile 的调用线程。
-	go func(p []byte) {
-		// 使用在 api.go 中定义的 goLogger。
-		goLogger(0, fmt.Sprintf(">>> [API-goroutine] WriteTunPacket: ENTERED. Packet size: %d.", len(p)))
+	// 从池中获取一个缓冲区
+	bufPtr := pktPool.Get().(*[]byte)
+	buf := *bufPtr
 
-		// 在 goroutine 内部处理 panic，避免搞垮整个程序
-		defer func() {
-			if r := recover(); r != nil {
-				panicMsg := fmt.Sprintf("!!!!!!!!!! PANIC RECOVERED IN WriteTunPacket GOROUTINE !!!!!!!!!! : %v", r)
-				goLogger(2, panicMsg)
-				fmt.Println(panicMsg)
-			}
-		}()
+	// 确保缓冲区容量足够，如果不够则重新分配
+	if cap(buf) < len(pkt) {
+		buf = make([]byte, len(pkt))
+	}
+	// 设置正确的长度并拷贝数据
+	buf = buf[:len(pkt)]
+	copy(buf, pkt)
 
-		cliMu.RLock()
-		// 如果 cli 为 nil，记录日志并安全退出 goroutine
-		if cli == nil {
-			goLogger(2, ">>> [API-goroutine] WriteTunPacket: ERROR - cli is nil.")
-			cliMu.RUnlock()
-			return
-		}
-		// cli 不是 nil，可以安全调用
-		err := cli.WriteFromTun(p)
-		cliMu.RUnlock() // 在完成调用后立即释放读锁
-
-		if err != nil {
-			goLogger(2, fmt.Sprintf(">>> [API-goroutine] WriteTunPacket: cli.WriteFromTun returned error: %v", err))
-		} else {
-			goLogger(1, ">>> [API-goroutine] WriteTunPacket: cli.WriteFromTun completed successfully.")
-		}
-
-	}(append([]byte(nil), pkt...)) // 关键：创建 pkt 的副本传递给 goroutine，防止数据竞争。
-
-	return nil // 立即返回，不向 Swift 报告下游错误（错误在 Go 日志中处理）。
+	// 使用非阻塞方式将数据包发送到队列
+	select {
+	case pktQueue <- buf:
+		// 成功发送
+		*bufPtr = buf // 更新指针指向的 slice
+		return nil
+	default:
+		// 队列已满，丢弃数据包以防止阻塞
+		goLogger(2, "[API] WriteTunPacket: pktQueue is full, dropping packet.")
+		// 将未被发送的缓冲区立即归还给池
+		*bufPtr = (*bufPtr)[:0]
+		pktPool.Put(bufPtr)
+		// 返回一个错误，向上游传递背压信号
+		return ErrNoData
+	}
 }
 
-// =======================================================
-
+// ReadTunPacket 保持不变，但通常不会被高频调用
 func (a *API) ReadTunPacket() ([]byte, error) {
-	goLogger(1, "[API] ReadTunPacket called. (User-provided version base)")
 	cliMu.RLock()
 	defer cliMu.RUnlock()
 	if cli == nil {
-		goLogger(2, "[API] ReadTunPacket: Error - cli is nil. (User-provided version base)")
 		return nil, errors.New("client not started")
 	}
-
 	buf := make([]byte, 65535)
 	n, err := cli.ReadToTun(buf)
 	if err != nil {
-		if err.Error() != "closed" {
-			goLogger(2, fmt.Sprintf("[API] ReadTunPacket: ReadToTun returned error: %s (User-provided version base)", err.Error()))
-		}
 		return nil, err
 	}
-	if n == 0 {
-		goLogger(1, "[API] ReadTunPacket: Read 0 bytes. (User-provided version base)")
-		return nil, nil
-	}
-
-	goLogger(1, fmt.Sprintf("[API] ReadTunPacket: Successfully read %d bytes. (User-provided version base)", n))
 	return buf[:n], nil
 }
 
+// ReadTunPacketNonBlock 保持不变
 func (a *API) ReadTunPacketNonBlock() ([]byte, error) {
 	cliMu.RLock()
 	defer cliMu.RUnlock()
 	if cli == nil {
 		return nil, errors.New("client not started")
 	}
-
 	buf := make([]byte, 65535)
 	n, err := cli.ReadToTun(buf)
-
 	if err != nil {
-		// ★ 把 gVisor / channel 的非致命状态统一映射成 ErrNoData
-		// 注意：根据 tun_dev.go 的实现，"closed" 错误是致命的，不应映射为 ErrNoData。
-		// 我们只处理那些可以被安全忽略的、代表“暂时无数据”的错误。
-		// 鉴于 ReadToTun 的非阻塞实现，它在无数据时应返回 (0, nil)，
-		// 所以这里的 err != nil 路径主要处理真实错误。
-		// 但为了保险，我们保留对 "timeout" 的检查。
 		if strings.Contains(err.Error(), "timeout") {
 			return nil, ErrNoData
 		}
-		// 其他真实错误
 		return nil, err
 	}
-
 	if n == 0 {
-		// 无包可读
 		return nil, ErrNoData
 	}
-
 	return buf[:n], nil
 }

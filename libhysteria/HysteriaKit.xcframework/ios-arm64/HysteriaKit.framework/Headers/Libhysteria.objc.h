@@ -30,12 +30,21 @@
 - (nullable instancetype)init;
 - (NSString* _Nonnull)getState;
 - (NSString* _Nonnull)pollLogs;
+/**
+ * ReadTunPacket 保持不变，但通常不会被高频调用
+ */
 - (NSData* _Nullable)readTunPacket:(NSError* _Nullable* _Nullable)error;
+/**
+ * ReadTunPacketNonBlock 保持不变
+ */
 - (NSData* _Nullable)readTunPacketNonBlock:(NSError* _Nullable* _Nullable)error;
+/**
+ * [PLAN STEP 1] 修正：在 Start 中启动 writerLoop
+ */
 - (BOOL)start:(NSString* _Nullable)jsonCfg error:(NSError* _Nullable* _Nullable)error;
 - (void)stop;
 /**
- * ==================== 唯一的修改点 ====================
+ * [PLAN STEP 1] 修正：重构 WriteTunPacket 以使用工作队列
  */
 - (BOOL)writeTunPacket:(NSData* _Nullable)pkt error:(NSError* _Nullable* _Nullable)error;
 @end
