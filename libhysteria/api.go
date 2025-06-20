@@ -7,24 +7,26 @@ import (
 	"sync"
 )
 
-/* ---------- 日志缓冲 (严格遵循您提供的版本) ---------- */
+/* ---------- 日志缓冲 ---------- */
 
 var (
-	logChan chan string
+	logChan  chan string
+	logLevel = 2 // 0=DEBUG, 1=INFO, 2=ERROR.
 )
 
 var ErrNoData = errors.New("no data")
 
-// goLogger (严格遵循您提供的版本)
 func goLogger(level int, msg string) {
+	if level < logLevel {
+		return
+	}
 	if logChan == nil {
 		return
 	}
-	prefix := [...]string{"INFO", "DEBUG", "ERROR"}[level%3]
+	prefix := [...]string{"DEBUG", "INFO", "ERROR"}[level%3]
 	select {
 	case logChan <- fmt.Sprintf("[%s] %s", prefix, msg):
 	default:
-		// Channel is full, drop log.
 	}
 }
 
@@ -37,56 +39,57 @@ var (
 	cli   *ClientBridge
 )
 
-// [PLAN STEP 1] 新增：用于工作队列模式的全局变量
+// MARK: - CORRECTED
+// 修正了 sync.Pool 的管理逻辑，这是解决内存泄漏和性能问题的核心。
 var (
-	// 使用 sync.Pool 复用数据包缓冲区，减少GC压力
+	// sync.Pool 用于复用数据包缓冲区，其类型为 *[]byte (指向字节切片的指针)
 	pktPool = sync.Pool{New: func() interface{} {
-		// 预分配 2048 字节，足以容纳大多数MTU
-		b := make([]byte, 2048)
+		b := make([]byte, 2048) // 预分配 2048 字节
 		return &b
 	}}
-	// 数据包工作队列，限制缓冲大小以控制内存
-	pktQueue = make(chan []byte, 1024)
+	// 工作队列的类型必须与 Pool 的类型匹配，传递指针而不是切片本身。
+	pktQueue = make(chan *[]byte, 1024)
 	// 确保 writerLoop 只启动一次
 	onceWriter sync.Once
 )
 
-// [PLAN STEP 1] 新增：处理数据包队列的常驻 goroutine
+// MARK: - CORRECTED
+// writerLoop 现在正确地处理从池中获取并归还缓冲区的逻辑。
 func writerLoop() {
 	goLogger(0, "[writerLoop] Starting packet writer loop.")
-	for p := range pktQueue {
+	// 从队列中接收的是缓冲区的指针 (pPtr)
+	for pPtr := range pktQueue {
 		cliMu.RLock()
 		c := cli
 		cliMu.RUnlock()
 
 		if c != nil {
-			err := c.WriteFromTun(p)
+			// 通过指针获取实际的数据切片 (*pPtr)
+			err := c.WriteFromTun(*pPtr)
 			if err != nil {
 				goLogger(2, fmt.Sprintf("[writerLoop] WriteFromTun failed: %v", err))
 			}
 		}
-		// 将缓冲区放回池中以供复用
-		// 我们需要从池中获取指向字节切片的指针，所以这里需要类型断言
-		ptr := pktPool.Get().(*[]byte)
-		*ptr = (*ptr)[:0] // 重置长度为0，但保留容量
-		pktPool.Put(ptr)
+		// **核心修复**：将使用完毕的缓冲区指针 pPtr 原封不动地放回池中。
+		// 在放回之前，重置切片长度为0，但保留其底层数组容量，以便下次复用。
+		*pPtr = (*pPtr)[:0]
+		pktPool.Put(pPtr)
 	}
 	goLogger(0, "[writerLoop] Packet writer loop stopped.")
 }
 
-// NewAPI (严格遵循您提供的版本)
 func NewAPI() *API {
 	if logChan == nil {
 		logChan = make(chan string, 100)
-		logChan <- "[INFO] >>>>>> Log channel initialized successfully by NewAPI! (User-provided version) <<<<<<"
+		logChan <- "[INFO] >>>>>> Log channel initialized successfully by NewAPI! <<<<<<"
 	}
-	goLogger(0, "[API] NewAPI instance created. (User-provided version)")
+	goLogger(0, "[API] NewAPI instance created.")
 	return &API{}
 }
 
 func (a *API) PollLogs() string {
 	if logChan == nil {
-		return "Log channel not initialized. (User-provided version)"
+		return "Log channel not initialized."
 	}
 	out := ""
 	for {
@@ -102,36 +105,27 @@ func (a *API) PollLogs() string {
 	}
 }
 
-// [PLAN STEP 1] 修正：在 Start 中启动 writerLoop
 func (a *API) Start(jsonCfg string) error {
 	goLogger(0, "[API] Start called.")
-
-	// 确保 writerLoop goroutine 已经启动
 	onceWriter.Do(func() {
 		go writerLoop()
 	})
-
 	cliMu.Lock()
 	defer cliMu.Unlock()
-
 	if cli != nil {
 		goLogger(1, "[API] Start: Existing client found, closing it first.")
 		_ = cli.Close()
 		cli = nil
 	}
-
 	goLogger(1, "[API] Start: Creating new client bridge.")
 	cb, err := newClientBridge(jsonCfg)
 	if err != nil {
 		goLogger(2, "[API] Start: newClientBridge failed: "+err.Error())
 		return err
 	}
-
 	cli = cb
 	goLogger(1, "[API] Start: New client bridge created. Starting connection in background.")
-
 	go cb.Connect()
-
 	goLogger(0, "[API] Start finished. Connection process running in background.")
 	return nil
 }
@@ -156,38 +150,36 @@ func (a *API) Stop() {
 	}
 }
 
-// [PLAN STEP 1] 修正：重构 WriteTunPacket 以使用工作队列
+// MARK: - CORRECTED
+// WriteTunPacket 现在将缓冲区的指针放入队列。
 func (a *API) WriteTunPacket(pkt []byte) error {
-	// 从池中获取一个缓冲区
+	// 从池中获取一个缓冲区指针
 	bufPtr := pktPool.Get().(*[]byte)
 	buf := *bufPtr
 
-	// 确保缓冲区容量足够，如果不够则重新分配
+	// 确保缓冲区容量足够
 	if cap(buf) < len(pkt) {
 		buf = make([]byte, len(pkt))
 	}
 	// 设置正确的长度并拷贝数据
 	buf = buf[:len(pkt)]
 	copy(buf, pkt)
+	*bufPtr = buf // 将更新后的切片信息写回指针指向的位置
 
-	// 使用非阻塞方式将数据包发送到队列
+	// 使用非阻塞方式将缓冲区指针发送到队列
 	select {
-	case pktQueue <- buf:
+	case pktQueue <- bufPtr:
 		// 成功发送
-		*bufPtr = buf // 更新指针指向的 slice
 		return nil
 	default:
 		// 队列已满，丢弃数据包以防止阻塞
 		goLogger(2, "[API] WriteTunPacket: pktQueue is full, dropping packet.")
-		// 将未被发送的缓冲区立即归还给池
-		*bufPtr = (*bufPtr)[:0]
+		// **核心修复**：将未被发送的缓冲区指针立即归还给池
 		pktPool.Put(bufPtr)
-		// 返回一个错误，向上游传递背压信号
 		return ErrNoData
 	}
 }
 
-// ReadTunPacket 保持不变，但通常不会被高频调用
 func (a *API) ReadTunPacket() ([]byte, error) {
 	cliMu.RLock()
 	defer cliMu.RUnlock()
@@ -202,7 +194,6 @@ func (a *API) ReadTunPacket() ([]byte, error) {
 	return buf[:n], nil
 }
 
-// ReadTunPacketNonBlock 保持不变
 func (a *API) ReadTunPacketNonBlock() ([]byte, error) {
 	cliMu.RLock()
 	defer cliMu.RUnlock()

@@ -12,7 +12,6 @@ type tunDevice struct {
 	once sync.Once
 }
 
-// [PLAN STEP 3] 修正：缩小 channel 容量
 func newTunDevice() *tunDevice {
 	goLogger(1, "[TunDevice] newTunDevice called.")
 	return &tunDevice{
@@ -31,7 +30,6 @@ func (d *tunDevice) ReadFromInChan() ([]byte, error) {
 	}
 }
 
-// [PLAN STEP 3] 修正：使用非阻塞写入，如果队列满则丢弃
 func (d *tunDevice) WriteToInChan(p []byte) error {
 	select {
 	case d.in <- p:
@@ -39,24 +37,29 @@ func (d *tunDevice) WriteToInChan(p []byte) error {
 	case <-d.cl:
 		return errors.New("closed")
 	default:
-		// 队列已满，丢弃数据包以防止阻塞上游
 		goLogger(2, "[TunDevice] WriteToInChan: 'in' channel is full, dropping packet.")
-		return nil // 返回 nil 表示“已处理”（即使是丢弃），避免上游报错
+		return nil
 	}
 }
 
+// MARK: - CORRECTED
+// 此函数已恢复为非阻塞读取。这是为了防止在 Swift Actor 中调用时发生死锁。
+// 当没有数据时，它会立即返回 nil, nil，由 Swift 端的指数退避逻辑来处理休眠，从而节省 CPU。
 func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
 	select {
-	case p := <-d.out:
+	case p, ok := <-d.out:
+		if !ok {
+			return nil, errors.New("closed")
+		}
 		return p, nil
 	case <-d.cl:
 		return nil, errors.New("closed")
 	default:
+		// 立即返回，表示当前没有数据包。
 		return nil, nil
 	}
 }
 
-// [PLAN STEP 3] 修正：使用非阻塞写入，如果队列满则丢弃
 func (d *tunDevice) WriteToOutChan(p []byte) error {
 	select {
 	case d.out <- p:
@@ -64,9 +67,8 @@ func (d *tunDevice) WriteToOutChan(p []byte) error {
 	case <-d.cl:
 		return errors.New("closed")
 	default:
-		// 队列已满，丢弃数据包以防止阻塞上游
 		goLogger(2, "[TunDevice] WriteToOutChan: 'out' channel is full, dropping packet.")
-		return nil // 返回 nil 表示“已处理”（即使是丢弃），避免上游报错
+		return nil
 	}
 }
 
