@@ -90,7 +90,7 @@ func initPacketIO(c *ClientBridge) {
 		wrapper := &tunDeviceWrapper{dev: tunDev}
 		mtu := c.tunConfig.MTU
 		if mtu == 0 {
-			mtu = 1420
+			mtu = 1280 // Default MTU if not specified
 		}
 		dev, err := iobased.New(wrapper, uint32(mtu), 0)
 		if err != nil {
