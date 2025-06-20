@@ -31,6 +31,7 @@
 - (NSString* _Nonnull)getState;
 - (NSString* _Nonnull)pollLogs;
 - (NSData* _Nullable)readTunPacket:(NSError* _Nullable* _Nullable)error;
+- (NSData* _Nullable)readTunPacketNonBlock:(NSError* _Nullable* _Nullable)error;
 - (BOOL)start:(NSString* _Nullable)jsonCfg error:(NSError* _Nullable* _Nullable)error;
 - (void)stop;
 /**
@@ -114,6 +115,12 @@
 // skipped field JSONTunConfig.Route with unsupported type: []string
 
 // skipped field JSONTunConfig.IPv4Exclude with unsupported type: []string
+
+@end
+
+@interface Libhysteria : NSObject
++ (NSError* _Nullable) errNoData;
++ (void) setErrNoData:(NSError* _Nullable)v;
 
 @end
 

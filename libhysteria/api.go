@@ -3,6 +3,7 @@ package libhysteria
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -11,6 +12,8 @@ import (
 var (
 	logChan chan string
 )
+
+var ErrNoData = errors.New("no data")
 
 // goLogger (严格遵循您提供的版本)
 func goLogger(level int, msg string) {
@@ -118,43 +121,42 @@ func (a *API) Stop() {
 }
 
 // ==================== 唯一的修改点 ====================
-func (a *API) WriteTunPacket(pkt []byte) (errRet error) { // Named return for defer/recover
-	// 使用您版本中的 goLogger，它有 logChan == nil 的保护
-	goLogger(0, fmt.Sprintf(">>> [API] WriteTunPacket: ENTERED (api.go with TOP LEVEL RECOVER). Packet size: %d.", len(pkt)))
+func (a *API) WriteTunPacket(pkt []byte) error {
+	// 立即将任务派发到新的 goroutine，并快速返回 nil。
+	// 这样可以防止任何下游的锁或IO操作阻塞 gomobile 的调用线程。
+	go func(p []byte) {
+		// 使用在 api.go 中定义的 goLogger。
+		goLogger(0, fmt.Sprintf(">>> [API-goroutine] WriteTunPacket: ENTERED. Packet size: %d.", len(p)))
 
-	defer func() {
-		if r := recover(); r != nil {
-			// 发生 Panic！
-			panicMsg := fmt.Sprintf("!!!!!!!!!! PANIC RECOVERED IN LibhysteriaAPI.WriteTunPacket !!!!!!!!!! : %v", r)
-			goLogger(2, panicMsg) // 尝试用 goLogger 记录
-			fmt.Println(panicMsg) // 同时尝试用 fmt.Println，万一 goLogger 也失效了
+		// 在 goroutine 内部处理 panic，避免搞垮整个程序
+		defer func() {
+			if r := recover(); r != nil {
+				panicMsg := fmt.Sprintf("!!!!!!!!!! PANIC RECOVERED IN WriteTunPacket GOROUTINE !!!!!!!!!! : %v", r)
+				goLogger(2, panicMsg)
+				fmt.Println(panicMsg)
+			}
+		}()
 
-			// 尝试将 panic 信息作为错误返回给 Swift
-			// 注意：如果 panic 导致 gomobile 桥本身损坏，这个错误可能也无法成功传递
-			errRet = errors.New("PANIC in Go WriteTunPacket: " + fmt.Sprint(r))
+		cliMu.RLock()
+		// 如果 cli 为 nil，记录日志并安全退出 goroutine
+		if cli == nil {
+			goLogger(2, ">>> [API-goroutine] WriteTunPacket: ERROR - cli is nil.")
+			cliMu.RUnlock()
+			return
 		}
-	}()
+		// cli 不是 nil，可以安全调用
+		err := cli.WriteFromTun(p)
+		cliMu.RUnlock() // 在完成调用后立即释放读锁
 
-	// --- 原有的逻辑 ---
-	goLogger(1, ">>> [API] WriteTunPacket: Checking cli...")
-	cliMu.RLock()
-	defer cliMu.RUnlock() // RUnlock 会在函数返回前执行，即使发生 panic (在 cli.WriteFromTun 之后)
+		if err != nil {
+			goLogger(2, fmt.Sprintf(">>> [API-goroutine] WriteTunPacket: cli.WriteFromTun returned error: %v", err))
+		} else {
+			goLogger(1, ">>> [API-goroutine] WriteTunPacket: cli.WriteFromTun completed successfully.")
+		}
 
-	if cli == nil {
-		goLogger(2, ">>> [API] WriteTunPacket: ERROR - cli is nil.")
-		return errors.New("client not started (API WriteTunPacket check)")
-	}
-	goLogger(1, ">>> [API] WriteTunPacket: cli is NOT nil. Calling cli.WriteFromTun...")
+	}(append([]byte(nil), pkt...)) // 关键：创建 pkt 的副本传递给 goroutine，防止数据竞争。
 
-	// 调用下游函数，这里也可能 panic
-	err := cli.WriteFromTun(pkt)
-	if err != nil {
-		goLogger(2, fmt.Sprintf(">>> [API] WriteTunPacket: cli.WriteFromTun returned error: %v", err))
-		return err
-	}
-
-	goLogger(1, ">>> [API] WriteTunPacket: cli.WriteFromTun completed successfully.")
-	return nil // 正常返回
+	return nil // 立即返回，不向 Swift 报告下游错误（错误在 Go 日志中处理）。
 }
 
 // =======================================================
@@ -182,5 +184,37 @@ func (a *API) ReadTunPacket() ([]byte, error) {
 	}
 
 	goLogger(1, fmt.Sprintf("[API] ReadTunPacket: Successfully read %d bytes. (User-provided version base)", n))
+	return buf[:n], nil
+}
+
+func (a *API) ReadTunPacketNonBlock() ([]byte, error) {
+	cliMu.RLock()
+	defer cliMu.RUnlock()
+	if cli == nil {
+		return nil, errors.New("client not started")
+	}
+
+	buf := make([]byte, 65535)
+	n, err := cli.ReadToTun(buf)
+
+	if err != nil {
+		// ★ 把 gVisor / channel 的非致命状态统一映射成 ErrNoData
+		// 注意：根据 tun_dev.go 的实现，"closed" 错误是致命的，不应映射为 ErrNoData。
+		// 我们只处理那些可以被安全忽略的、代表“暂时无数据”的错误。
+		// 鉴于 ReadToTun 的非阻塞实现，它在无数据时应返回 (0, nil)，
+		// 所以这里的 err != nil 路径主要处理真实错误。
+		// 但为了保险，我们保留对 "timeout" 的检查。
+		if strings.Contains(err.Error(), "timeout") {
+			return nil, ErrNoData
+		}
+		// 其他真实错误
+		return nil, err
+	}
+
+	if n == 0 {
+		// 无包可读
+		return nil, ErrNoData
+	}
+
 	return buf[:n], nil
 }

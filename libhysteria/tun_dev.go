@@ -45,7 +45,7 @@ func (d *tunDevice) WriteToInChan(p []byte) error {
 	}
 }
 func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
-	goLogger(1, "[TunDevice] ReadFromOutChan: Waiting on 'out' channel.")
+	// goLogger(1, "[TunDevice] ReadFromOutChan: Waiting on 'out' channel.") // 注释掉以减少日志刷屏
 	select {
 	case p := <-d.out:
 		goLogger(1, fmt.Sprintf("[TunDevice] ReadFromOutChan: Read %d bytes.", len(p)))
@@ -53,6 +53,9 @@ func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
 	case <-d.cl:
 		goLogger(1, "[TunDevice] ReadFromOutChan: 'cl' channel closed.")
 		return nil, errors.New("closed")
+	default:
+		// 当 'out' 和 'cl' 都没有数据时，立即返回，实现非阻塞
+		return nil, nil
 	}
 }
 func (d *tunDevice) WriteToOutChan(p []byte) error {
