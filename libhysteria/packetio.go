@@ -1,10 +1,12 @@
+// packetio.go
+
 package libhysteria
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"strings" // 确保导入 strings 包
+	"strings"
 	"sync"
 	"time"
 
@@ -38,10 +40,6 @@ func (w *tunDeviceWrapper) Read(p []byte) (int, error) {
 }
 
 func (w *tunDeviceWrapper) Write(p []byte) (int, error) {
-	// ================== 探针 3: gVisor -> TUN ==================
-	goLogger(0, fmt.Sprintf(">>>>>> PROBE 3: gVisor is writing %d bytes to TUN.", len(p)))
-	// ==========================================================
-
 	buf := make([]byte, len(p))
 	copy(buf, p)
 	err := w.dev.WriteToOutChan(buf)
@@ -49,7 +47,6 @@ func (w *tunDeviceWrapper) Write(p []byte) (int, error) {
 		goLogger(2, fmt.Sprintf(">>>>>> PROBE 3 FAILED: WriteToOutChan error: %v", err))
 		return 0, err
 	}
-	goLogger(0, ">>>>>> PROBE 3 SUCCESS: Packet sent to tun_dev.out channel.")
 	return len(p), nil
 }
 
@@ -65,12 +62,16 @@ func initPacketIO(c *ClientBridge) {
 		tunDev = newTunDevice()
 		goLogger(1, "[PacketIO] initPacketIO: newTunDevice created.")
 
-		udpTimeout := 2 * time.Minute
+		udpTimeout := 60 * time.Second
 		tunnel.T().SetUDPTimeout(udpTimeout)
 		goLogger(0, fmt.Sprintf("[PacketIO] Set global UDP timeout to %v", udpTimeout))
 
 		wrapper := &tunDeviceWrapper{dev: tunDev}
-		dev, err := iobased.New(wrapper, 1280, 0)
+		mtu := c.tunConfig.MTU
+		if mtu == 0 {
+			mtu = 1420
+		}
+		dev, err := iobased.New(wrapper, uint32(mtu), 0)
 		if err != nil {
 			goLogger(2, fmt.Sprintf("[PacketIO] initPacketIO: Failed to create iobased device: %s", err.Error()))
 			return
@@ -99,43 +100,30 @@ func initPacketIO(c *ClientBridge) {
 }
 
 func (c *ClientBridge) WriteFromTun(p []byte) error {
-	// 这是我们最关心的日志，确认 Swift 是否成功调用到这里。
-	goLogger(0, ">>>>>>>>>> [ClientBridge] WriteFromTun: ENTERED TOP OF FUNCTION (packetio.go) <<<<<<<<<<")
-	goLogger(0, fmt.Sprintf(">>> [ClientBridge] WriteFromTun: Packet size: %d. Attempting to init packet IO.", len(p)))
-
-	// 确保 ClientBridge 实例本身不是 nil (防御性编程)
 	if c == nil {
 		goLogger(2, ">>> [ClientBridge] WriteFromTun: CRITICAL ERROR - ClientBridge instance (c) is nil!")
 		return errors.New("ClientBridge instance is nil in WriteFromTun")
 	}
-
-	initPacketIO(c) // 调用 initPacketIO，它内部有 sync.Once 保护
-
+	initPacketIO(c)
 	if tunDev == nil {
 		goLogger(2, ">>> [ClientBridge] WriteFromTun: ERROR - tunDev is nil after initPacketIO call. Cannot write to InChan.")
 		return errors.New("tunDevice not initialized in WriteFromTun (packetio.go)")
 	}
-
 	buf := make([]byte, len(p))
 	copy(buf, p)
 	return tunDev.WriteToInChan(buf)
 }
 
 func (c *ClientBridge) ReadToTun(out []byte) (int, error) {
-	goLogger(0, ">>> [ClientBridge] ReadToTun: ENTERED (packetio.go). Attempting to init packet IO.")
-
 	if c == nil {
 		goLogger(2, ">>> [ClientBridge] ReadToTun: CRITICAL ERROR - ClientBridge instance (c) is nil!")
 		return 0, errors.New("ClientBridge instance is nil in ReadToTun")
 	}
-
 	initPacketIO(c)
-
 	if tunDev == nil {
 		goLogger(2, ">>> [ClientBridge] ReadToTun: ERROR - tunDev is nil after initPacketIO call. Cannot read from OutChan.")
 		return 0, errors.New("tunDevice not initialized in ReadToTun (packetio.go)")
 	}
-
 	p, err := tunDev.ReadFromOutChan()
 	if err != nil {
 		if err.Error() != "closed" {
@@ -175,7 +163,11 @@ type proxyHandler struct {
 	udp *udpHandler
 }
 
-// [PLAN A] 修正：为 HandleTCP 添加更详细的日志探针
+// ==================== MODIFICATION START (CRITICAL FIX) ====================
+// MARK: - CORRECTED (Fix for TCP handling block and goroutine leak)
+// This version ensures both data flow directions are in separate goroutines,
+// preventing the HandleTCP function from blocking the main tun2socks loop.
+// It uses sync.Once to guarantee that cleanup logic runs exactly once.
 func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 	dst := conn.LocalAddr().String()
 	goLogger(1, fmt.Sprintf("[TCPHandler] Handle: New TCP connection for %s.", dst))
@@ -186,51 +178,41 @@ func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 		_ = conn.Close()
 		return
 	}
-	// [PLAN A] 新增探针
 	goLogger(0, fmt.Sprintf(">>>>>> PROBE A.1 (TCP): Hysteria TCP dial for %s successful. Starting bi-directional copy.", dst))
+
+	var closeOnce sync.Once
+	cleanup := func() {
+		conn.Close()
+		r.Close()
+		goLogger(1, fmt.Sprintf("[TCPHandler] Cleanup executed for %s.", dst))
+	}
 
 	// gVisor -> Hysteria
 	go func() {
-		defer r.Close()
-		defer conn.Close()
-		goLogger(1, fmt.Sprintf("[TCPHandler] io.Copy gVisor->Hysteria for %s started.", dst))
-		written, errCopy := io.Copy(r, conn)
-		if errCopy != nil && errCopy != io.EOF {
-			goLogger(1, fmt.Sprintf("[TCPHandler] io.Copy gVisor->Hysteria for %s finished with error: %v. Bytes written: %d", dst, errCopy, written))
-		} else {
-			goLogger(1, fmt.Sprintf("[TCPHandler] io.Copy gVisor->Hysteria for %s finished. Bytes written: %d", dst, written))
+		_, err := io.Copy(r, conn)
+		if err != nil && err != io.EOF {
+			goLogger(1, fmt.Sprintf("[TCPHandler] gVisor->Hysteria copy for %s finished with error: %v", dst, err))
 		}
+		closeOnce.Do(cleanup)
 	}()
 
 	// Hysteria -> gVisor
 	go func() {
-		defer conn.Close()
-		defer r.Close()
-		goLogger(1, fmt.Sprintf("[TCPHandler] io.Copy Hysteria->gVisor for %s started.", dst))
-		written, errCopy := io.Copy(conn, r)
-		// [PLAN A] 新增探针
-		if errCopy != nil && errCopy != io.EOF {
-			goLogger(2, fmt.Sprintf(">>>>>> PROBE 2 FAILED (TCP %s): io.Copy Hysteria->gVisor finished with error: %v. Bytes written: %d", dst, errCopy, written))
-		} else {
-			goLogger(0, fmt.Sprintf(">>>>>> PROBE 2 SUCCESS (TCP %s): io.Copy Hysteria->gVisor finished, %d bytes written.", dst, written))
+		_, err := io.Copy(conn, r)
+		if err != nil && err != io.EOF {
+			goLogger(1, fmt.Sprintf("[TCPHandler] Hysteria->gVisor copy for %s finished with error: %v", dst, err))
 		}
-		goLogger(1, fmt.Sprintf("[TCPHandler] io.Copy Hysteria->gVisor for %s finished.", dst))
+		closeOnce.Do(cleanup)
 	}()
 }
 
-// [PLAN A] 修正：为 HandleUDP 添加更详细的日志探针
+// ===================== MODIFICATION END (CRITICAL FIX) =====================
+
 func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
-	// ❌ 原来：把本地地址当成远端
-	// dst := conn.RemoteAddr().String()
-
-	// ✅ 改成：真正的目的端口应当取自 gVisor 记录的“目标”(destination)
-	dst := conn.LocalAddr().String() // ← 只改这一行
-
+	dst := conn.LocalAddr().String()
 	goLogger(1, fmt.Sprintf("[UDPHandler] Handle: New UDP association for %s.", dst))
 	h.udp.conns.Store(dst, conn)
-	goLogger(0, fmt.Sprintf(">>>>>> PROBE A.2 (UDP): New UDP association for %s stored.", dst))
 
-	// gVisor -> Hysteria
 	go func() {
 		defer h.udp.conns.Delete(dst)
 		defer conn.Close()
@@ -247,7 +229,6 @@ func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
 				goLogger(2, fmt.Sprintf("[UDPHandler] Hysteria UDP session (h.c.udp) is nil. Cannot send packet to %s.", dst))
 				return
 			}
-			goLogger(1, fmt.Sprintf("[UDPHandler] Sending %d bytes from gVisor to remote UDP %s.", n, dst))
 			err = h.c.udp.Send(buf[:n], dst)
 			if err != nil {
 				goLogger(2, fmt.Sprintf("[UDPHandler] Hysteria UDP Send for %s failed: %v.", dst, err))
@@ -267,22 +248,18 @@ func (h *udpHandler) loop() {
 	goLogger(1, "[UDPHandler] loop: Goroutine started, waiting for inbound UDP packets from Hysteria.")
 	for p := range h.c.inboundUDPQ {
 		if p == nil {
-			goLogger(1, "[UDPHandler] loop: Received nil packet from inboundUDPQ, skipping.")
 			continue
 		}
 		dst := p.SrcAddr.String()
-		goLogger(0, fmt.Sprintf(">>>>>> PROBE 1: Received UDP packet from Hysteria for %s (%d bytes).", dst, len(p.Data)))
-
 		if v, ok := h.conns.Load(dst); ok {
 			conn := v.(adapter.UDPConn)
-			// [PLAN A] 新增探针
-			goLogger(0, fmt.Sprintf(">>>>>> PROBE A.3 (UDP): Found UDP association for %s. Writing %d bytes to gVisor.", dst, len(p.Data)))
 			_, err := conn.Write(p.Data)
 			if err != nil {
 				goLogger(2, fmt.Sprintf(">>>>>> PROBE 2 FAILED (UDP %s): Write to gVisor FAILED: %s", dst, err.Error()))
+				h.conns.Delete(dst)
 			}
 		} else {
-			goLogger(2, fmt.Sprintf(">>>>>> PROBE 2 FAILED (UDP %s): No UDP association found! Packet dropped. (This might be due to a timeout or connection already closed)", dst))
+			goLogger(1, fmt.Sprintf(">>>>>> PROBE 2 FAILED (UDP %s): No UDP association found! Packet dropped. (This might be due to a timeout or connection already closed)", dst))
 		}
 	}
 	goLogger(0, "[UDPHandler] loop: Inbound UDP queue (h.c.inboundUDPQ) closed, goroutine finished.")

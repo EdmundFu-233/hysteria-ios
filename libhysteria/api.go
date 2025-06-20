@@ -1,3 +1,5 @@
+// api.go
+
 package libhysteria
 
 import (
@@ -39,41 +41,37 @@ var (
 	cli   *ClientBridge
 )
 
-// MARK: - CORRECTED
-// 修正了 sync.Pool 的管理逻辑，这是解决内存泄漏和性能问题的核心。
+const maxBufferSizeForPool = 4096
+
 var (
-	// sync.Pool 用于复用数据包缓冲区，其类型为 *[]byte (指向字节切片的指针)
 	pktPool = sync.Pool{New: func() interface{} {
-		b := make([]byte, 2048) // 预分配 2048 字节
+		b := make([]byte, 2048)
 		return &b
 	}}
-	// 工作队列的类型必须与 Pool 的类型匹配，传递指针而不是切片本身。
-	pktQueue = make(chan *[]byte, 1024)
-	// 确保 writerLoop 只启动一次
+	pktQueue   = make(chan *[]byte, 1024)
 	onceWriter sync.Once
 )
 
-// MARK: - CORRECTED
-// writerLoop 现在正确地处理从池中获取并归还缓冲区的逻辑。
 func writerLoop() {
 	goLogger(0, "[writerLoop] Starting packet writer loop.")
-	// 从队列中接收的是缓冲区的指针 (pPtr)
 	for pPtr := range pktQueue {
 		cliMu.RLock()
 		c := cli
 		cliMu.RUnlock()
 
 		if c != nil {
-			// 通过指针获取实际的数据切片 (*pPtr)
 			err := c.WriteFromTun(*pPtr)
 			if err != nil {
 				goLogger(2, fmt.Sprintf("[writerLoop] WriteFromTun failed: %v", err))
 			}
 		}
-		// **核心修复**：将使用完毕的缓冲区指针 pPtr 原封不动地放回池中。
-		// 在放回之前，重置切片长度为0，但保留其底层数组容量，以便下次复用。
-		*pPtr = (*pPtr)[:0]
-		pktPool.Put(pPtr)
+
+		if cap(*pPtr) > maxBufferSizeForPool {
+			goLogger(0, fmt.Sprintf("[writerLoop] Discarding oversized buffer (cap %d) instead of returning to pool.", cap(*pPtr)))
+		} else {
+			*pPtr = (*pPtr)[:0]
+			pktPool.Put(pPtr)
+		}
 	}
 	goLogger(0, "[writerLoop] Packet writer loop stopped.")
 }
@@ -150,31 +148,22 @@ func (a *API) Stop() {
 	}
 }
 
-// MARK: - CORRECTED
-// WriteTunPacket 现在将缓冲区的指针放入队列。
 func (a *API) WriteTunPacket(pkt []byte) error {
-	// 从池中获取一个缓冲区指针
 	bufPtr := pktPool.Get().(*[]byte)
 	buf := *bufPtr
 
-	// 确保缓冲区容量足够
 	if cap(buf) < len(pkt) {
 		buf = make([]byte, len(pkt))
 	}
-	// 设置正确的长度并拷贝数据
 	buf = buf[:len(pkt)]
 	copy(buf, pkt)
-	*bufPtr = buf // 将更新后的切片信息写回指针指向的位置
+	*bufPtr = buf
 
-	// 使用非阻塞方式将缓冲区指针发送到队列
 	select {
 	case pktQueue <- bufPtr:
-		// 成功发送
 		return nil
 	default:
-		// 队列已满，丢弃数据包以防止阻塞
 		goLogger(2, "[API] WriteTunPacket: pktQueue is full, dropping packet.")
-		// **核心修复**：将未被发送的缓冲区指针立即归还给池
 		pktPool.Put(bufPtr)
 		return ErrNoData
 	}

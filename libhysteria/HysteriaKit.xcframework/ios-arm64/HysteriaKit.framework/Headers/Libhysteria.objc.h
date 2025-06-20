@@ -31,10 +31,6 @@
 - (NSData* _Nullable)readTunPacketNonBlock:(NSError* _Nullable* _Nullable)error;
 - (BOOL)start:(NSString* _Nullable)jsonCfg error:(NSError* _Nullable* _Nullable)error;
 - (void)stop;
-/**
- * MARK: - CORRECTED
-WriteTunPacket 现在将缓冲区的指针放入队列。
- */
 - (BOOL)writeTunPacket:(NSData* _Nullable)pkt error:(NSError* _Nullable* _Nullable)error;
 @end
 

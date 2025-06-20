@@ -1,3 +1,5 @@
+// tun_dev.go
+
 package libhysteria
 
 import (
@@ -14,11 +16,15 @@ type tunDevice struct {
 
 func newTunDevice() *tunDevice {
 	goLogger(1, "[TunDevice] newTunDevice called.")
+	// ==================== MODIFICATION START ====================
+	// P1 修复：将通道缓冲区大小从1024增加到4096，以更好地处理突发流量，
+	// 减少因队列满而导致的丢包，从而提高吞吐量。
 	return &tunDevice{
-		in:  make(chan []byte, 1024),
-		out: make(chan []byte, 1024),
+		in:  make(chan []byte, 4096),
+		out: make(chan []byte, 4096),
 		cl:  make(chan struct{}),
 	}
+	// ===================== MODIFICATION END =====================
 }
 
 func (d *tunDevice) ReadFromInChan() ([]byte, error) {
@@ -42,9 +48,6 @@ func (d *tunDevice) WriteToInChan(p []byte) error {
 	}
 }
 
-// MARK: - CORRECTED
-// 此函数已恢复为非阻塞读取。这是为了防止在 Swift Actor 中调用时发生死锁。
-// 当没有数据时，它会立即返回 nil, nil，由 Swift 端的指数退避逻辑来处理休眠，从而节省 CPU。
 func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
 	select {
 	case p, ok := <-d.out:
@@ -55,7 +58,6 @@ func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
 	case <-d.cl:
 		return nil, errors.New("closed")
 	default:
-		// 立即返回，表示当前没有数据包。
 		return nil, nil
 	}
 }
