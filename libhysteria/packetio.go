@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -55,6 +56,9 @@ func (w *tunDeviceWrapper) Close() error {
 	return nil
 }
 
+// 全局UDP超时时间
+const udpTimeout = 60 * time.Second
+
 func initPacketIO(c *ClientBridge) {
 	goLogger(0, "[PacketIO] initPacketIO: ENTERED (packetio.go).")
 	ioOnce.Do(func() {
@@ -62,7 +66,6 @@ func initPacketIO(c *ClientBridge) {
 		tunDev = newTunDevice()
 		goLogger(1, "[PacketIO] initPacketIO: newTunDevice created.")
 
-		udpTimeout := 60 * time.Second
 		tunnel.T().SetUDPTimeout(udpTimeout)
 		goLogger(0, fmt.Sprintf("[PacketIO] Set global UDP timeout to %v", udpTimeout))
 
@@ -163,11 +166,6 @@ type proxyHandler struct {
 	udp *udpHandler
 }
 
-// ==================== MODIFICATION START (CRITICAL FIX) ====================
-// MARK: - CORRECTED (Fix for TCP handling block and goroutine leak)
-// This version ensures both data flow directions are in separate goroutines,
-// preventing the HandleTCP function from blocking the main tun2socks loop.
-// It uses sync.Once to guarantee that cleanup logic runs exactly once.
 func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 	dst := conn.LocalAddr().String()
 	goLogger(1, fmt.Sprintf("[TCPHandler] Handle: New TCP connection for %s.", dst))
@@ -187,7 +185,6 @@ func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 		goLogger(1, fmt.Sprintf("[TCPHandler] Cleanup executed for %s.", dst))
 	}
 
-	// gVisor -> Hysteria
 	go func() {
 		_, err := io.Copy(r, conn)
 		if err != nil && err != io.EOF {
@@ -196,7 +193,6 @@ func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 		closeOnce.Do(cleanup)
 	}()
 
-	// Hysteria -> gVisor
 	go func() {
 		_, err := io.Copy(conn, r)
 		if err != nil && err != io.EOF {
@@ -206,25 +202,44 @@ func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 	}()
 }
 
-// ===================== MODIFICATION END (CRITICAL FIX) =====================
-
+// ==================== MODIFICATION START (FINAL MEMORY LEAK FIX) ====================
+// MARK: - CORRECTED (Fix for UDP goroutine and map entry leak)
 func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
 	dst := conn.LocalAddr().String()
 	goLogger(1, fmt.Sprintf("[UDPHandler] Handle: New UDP association for %s.", dst))
 	h.udp.conns.Store(dst, conn)
 
+	// 这个goroutine负责将App发出的数据包转发到互联网。
+	// 它现在包含一个主动的读取超时，以防止在连接空闲时永久阻塞，从而杜绝内存泄漏。
 	go func() {
+		// 当goroutine退出时（无论是正常退出还是因错误退出），
+		// 都确保从map中删除条目并关闭连接。
 		defer h.udp.conns.Delete(dst)
 		defer conn.Close()
+
 		buf := make([]byte, 65535)
 		for {
-			n, _, err := conn.ReadFrom(buf)
+			// 核心修复：在每次读取前设置一个超时。
+			// 如果连接在 `udpTimeout` 期间内没有任何数据从App传来，
+			// `ReadFrom` 将会返回一个超时错误，从而使这个goroutine能够退出。
+			err := conn.SetReadDeadline(time.Now().Add(udpTimeout))
 			if err != nil {
-				if !strings.Contains(err.Error(), "use of closed network connection") && !strings.Contains(err.Error(), "connection refused") {
-					goLogger(1, fmt.Sprintf("[UDPHandler] ReadFrom gVisor for %s failed: %v. Closing association.", dst, err))
-				}
+				goLogger(1, fmt.Sprintf("[UDPHandler] SetReadDeadline for %s failed: %v", dst, err))
 				return
 			}
+
+			n, _, err := conn.ReadFrom(buf)
+			if err != nil {
+				// 如果是超时错误，这是预期的行为，我们静默退出即可。
+				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+					goLogger(0, fmt.Sprintf("[UDPHandler] Connection for %s timed out due to inactivity. Cleaning up.", dst))
+				} else if !strings.Contains(err.Error(), "use of closed network connection") {
+					// 对于其他非预期的错误，我们记录下来。
+					goLogger(1, fmt.Sprintf("[UDPHandler] ReadFrom gVisor for %s failed: %v. Cleaning up.", dst, err))
+				}
+				return // 任何错误都会导致goroutine退出，并触发defer清理。
+			}
+
 			if h.c.udp == nil {
 				goLogger(2, fmt.Sprintf("[UDPHandler] Hysteria UDP session (h.c.udp) is nil. Cannot send packet to %s.", dst))
 				return
@@ -236,6 +251,8 @@ func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
 		}
 	}()
 }
+
+// ===================== MODIFICATION END (FINAL MEMORY LEAK FIX) =====================
 
 type udpHandler struct {
 	c     *ClientBridge
