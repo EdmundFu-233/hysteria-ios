@@ -48,7 +48,10 @@ var (
 		b := make([]byte, 2048)
 		return &b
 	}}
-	pktQueue   = make(chan *[]byte, 1024)
+	// ==================== MODIFICATION START (FINAL TUNING) ====================
+	// 进一步减小 pktQueue 的大小，以降低内存占用。
+	pktQueue = make(chan *[]byte, 512)
+	// ===================== MODIFICATION END (FINAL TUNING) =====================
 	onceWriter sync.Once
 )
 

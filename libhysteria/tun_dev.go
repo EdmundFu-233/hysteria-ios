@@ -9,22 +9,21 @@ import (
 
 type tunDevice struct {
 	in   chan []byte
-	out  chan []byte
+	out  chan *[]byte
 	cl   chan struct{}
 	once sync.Once
 }
 
 func newTunDevice() *tunDevice {
 	goLogger(1, "[TunDevice] newTunDevice called.")
-	// ==================== MODIFICATION START ====================
-	// P1 修复：将通道缓冲区大小从1024增加到4096，以更好地处理突发流量，
-	// 减少因队列满而导致的丢包，从而提高吞吐量。
+	// ==================== MODIFICATION START (FINAL TUNING) ====================
+	// 进一步减小通道缓冲区大小。
 	return &tunDevice{
-		in:  make(chan []byte, 4096),
-		out: make(chan []byte, 4096),
+		in:  make(chan []byte, 1024),
+		out: make(chan *[]byte, 1024),
 		cl:  make(chan struct{}),
 	}
-	// ===================== MODIFICATION END =====================
+	// ===================== MODIFICATION END (FINAL TUNING) =====================
 }
 
 func (d *tunDevice) ReadFromInChan() ([]byte, error) {
@@ -48,7 +47,7 @@ func (d *tunDevice) WriteToInChan(p []byte) error {
 	}
 }
 
-func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
+func (d *tunDevice) ReadFromOutChan() (*[]byte, error) {
 	select {
 	case p, ok := <-d.out:
 		if !ok {
@@ -62,7 +61,7 @@ func (d *tunDevice) ReadFromOutChan() ([]byte, error) {
 	}
 }
 
-func (d *tunDevice) WriteToOutChan(p []byte) error {
+func (d *tunDevice) WriteToOutChan(p *[]byte) error {
 	select {
 	case d.out <- p:
 		return nil
@@ -70,6 +69,7 @@ func (d *tunDevice) WriteToOutChan(p []byte) error {
 		return errors.New("closed")
 	default:
 		goLogger(2, "[TunDevice] WriteToOutChan: 'out' channel is full, dropping packet.")
+		outBufPool.Put(p)
 		return nil
 	}
 }

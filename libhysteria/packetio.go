@@ -24,6 +24,11 @@ var (
 	gvisorStack *stack.Stack
 )
 
+var outBufPool = sync.Pool{New: func() interface{} {
+	b := make([]byte, 2048)
+	return &b
+}}
+
 type tunDeviceWrapper struct {
 	dev *tunDevice
 }
@@ -41,11 +46,20 @@ func (w *tunDeviceWrapper) Read(p []byte) (int, error) {
 }
 
 func (w *tunDeviceWrapper) Write(p []byte) (int, error) {
-	buf := make([]byte, len(p))
+	bufPtr := outBufPool.Get().(*[]byte)
+	buf := *bufPtr
+
+	if cap(buf) < len(p) {
+		buf = make([]byte, len(p))
+	}
+	buf = buf[:len(p)]
 	copy(buf, p)
-	err := w.dev.WriteToOutChan(buf)
+	*bufPtr = buf
+
+	err := w.dev.WriteToOutChan(bufPtr)
 	if err != nil {
 		goLogger(2, fmt.Sprintf(">>>>>> PROBE 3 FAILED: WriteToOutChan error: %v", err))
+		outBufPool.Put(bufPtr)
 		return 0, err
 	}
 	return len(p), nil
@@ -56,8 +70,12 @@ func (w *tunDeviceWrapper) Close() error {
 	return nil
 }
 
-// 全局UDP超时时间
-const udpTimeout = 60 * time.Second
+// ==================== MODIFICATION START (FINAL TUNING) ====================
+// 核心优化：将UDP会话的空闲超时从60秒大幅缩短到3秒。
+// 这将使失败和空闲的连接被更快地清理，显著降低内存峰值。
+const udpTimeout = 3 * time.Second
+
+// ===================== MODIFICATION END (FINAL TUNING) =====================
 
 func initPacketIO(c *ClientBridge) {
 	goLogger(0, "[PacketIO] initPacketIO: ENTERED (packetio.go).")
@@ -112,9 +130,7 @@ func (c *ClientBridge) WriteFromTun(p []byte) error {
 		goLogger(2, ">>> [ClientBridge] WriteFromTun: ERROR - tunDev is nil after initPacketIO call. Cannot write to InChan.")
 		return errors.New("tunDevice not initialized in WriteFromTun (packetio.go)")
 	}
-	buf := make([]byte, len(p))
-	copy(buf, p)
-	return tunDev.WriteToInChan(buf)
+	return tunDev.WriteToInChan(p)
 }
 
 func (c *ClientBridge) ReadToTun(out []byte) (int, error) {
@@ -127,13 +143,21 @@ func (c *ClientBridge) ReadToTun(out []byte) (int, error) {
 		goLogger(2, ">>> [ClientBridge] ReadToTun: ERROR - tunDev is nil after initPacketIO call. Cannot read from OutChan.")
 		return 0, errors.New("tunDevice not initialized in ReadToTun (packetio.go)")
 	}
-	p, err := tunDev.ReadFromOutChan()
+
+	pPtr, err := tunDev.ReadFromOutChan()
 	if err != nil {
 		if err.Error() != "closed" {
 			goLogger(2, fmt.Sprintf("[ClientBridge] ReadToTun: tunDev.ReadFromOutChan error: %s (packetio.go)", err.Error()))
 		}
 		return 0, err
 	}
+	if pPtr == nil {
+		return 0, nil
+	}
+
+	defer outBufPool.Put(pPtr)
+
+	p := *pPtr
 	if len(p) > len(out) {
 		goLogger(2, "[ClientBridge] ReadToTun: Buffer too small! (packetio.go)")
 		return 0, errors.New("buf too small")
@@ -202,26 +226,17 @@ func (h *proxyHandler) HandleTCP(conn adapter.TCPConn) {
 	}()
 }
 
-// ==================== MODIFICATION START (FINAL MEMORY LEAK FIX) ====================
-// MARK: - CORRECTED (Fix for UDP goroutine and map entry leak)
 func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
 	dst := conn.LocalAddr().String()
 	goLogger(1, fmt.Sprintf("[UDPHandler] Handle: New UDP association for %s.", dst))
 	h.udp.conns.Store(dst, conn)
 
-	// 这个goroutine负责将App发出的数据包转发到互联网。
-	// 它现在包含一个主动的读取超时，以防止在连接空闲时永久阻塞，从而杜绝内存泄漏。
 	go func() {
-		// 当goroutine退出时（无论是正常退出还是因错误退出），
-		// 都确保从map中删除条目并关闭连接。
 		defer h.udp.conns.Delete(dst)
 		defer conn.Close()
 
 		buf := make([]byte, 65535)
 		for {
-			// 核心修复：在每次读取前设置一个超时。
-			// 如果连接在 `udpTimeout` 期间内没有任何数据从App传来，
-			// `ReadFrom` 将会返回一个超时错误，从而使这个goroutine能够退出。
 			err := conn.SetReadDeadline(time.Now().Add(udpTimeout))
 			if err != nil {
 				goLogger(1, fmt.Sprintf("[UDPHandler] SetReadDeadline for %s failed: %v", dst, err))
@@ -230,14 +245,12 @@ func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
 
 			n, _, err := conn.ReadFrom(buf)
 			if err != nil {
-				// 如果是超时错误，这是预期的行为，我们静默退出即可。
 				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 					goLogger(0, fmt.Sprintf("[UDPHandler] Connection for %s timed out due to inactivity. Cleaning up.", dst))
 				} else if !strings.Contains(err.Error(), "use of closed network connection") {
-					// 对于其他非预期的错误，我们记录下来。
 					goLogger(1, fmt.Sprintf("[UDPHandler] ReadFrom gVisor for %s failed: %v. Cleaning up.", dst, err))
 				}
-				return // 任何错误都会导致goroutine退出，并触发defer清理。
+				return
 			}
 
 			if h.c.udp == nil {
@@ -251,8 +264,6 @@ func (h *proxyHandler) HandleUDP(conn adapter.UDPConn) {
 		}
 	}()
 }
-
-// ===================== MODIFICATION END (FINAL MEMORY LEAK FIX) =====================
 
 type udpHandler struct {
 	c     *ClientBridge

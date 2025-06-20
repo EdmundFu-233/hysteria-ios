@@ -1,3 +1,5 @@
+// client.go
+
 package libhysteria
 
 import (
@@ -64,8 +66,11 @@ type ClientBridge struct {
 func newClientBridge(raw string) (*ClientBridge, error) {
 	goLogger(0, "[ClientBridge] newClientBridge called.")
 	cb := &ClientBridge{
-		inboundUDPQ: make(chan *InboundUDPPacket, 4096),
-		rawConfig:   raw,
+		// ==================== MODIFICATION START (PERFORMANCE) ====================
+		// 减小通道缓冲区大小，以降低基线内存占用。
+		inboundUDPQ: make(chan *InboundUDPPacket, 2048),
+		// ===================== MODIFICATION END (PERFORMANCE) =====================
+		rawConfig: raw,
 	}
 	cb.state.Store("connecting")
 	goLogger(1, "[ClientBridge] newClientBridge: State set to 'connecting'.")
@@ -104,12 +109,22 @@ func parseBandwidth(s string) uint64 {
 	return val * multiplier
 }
 
+// ==================== MODIFICATION START (CRITICAL FIX) ====================
+// MARK: - CORRECTED (Robust connection with self-cleanup on failure)
 func (c *ClientBridge) Connect() {
+	// 核心修复：使用一个函数局部变量来处理失败时的清理工作。
+	// 这样可以确保即使连接失败，已分配的资源（如inboundUDPQ）也能被立即释放。
+	failAndCleanup := func(errMsg string) {
+		goLogger(2, errMsg)
+		c.state.Store("failed: " + errMsg)
+		// 关闭通道，释放其占用的内存，并通知可能正在等待的goroutine退出。
+		close(c.inboundUDPQ)
+	}
+
 	goLogger(0, "[ClientBridge] Connect: Starting connection process in goroutine.")
 	var jc JSONConfig
 	if err := json.Unmarshal([]byte(c.rawConfig), &jc); err != nil {
-		goLogger(2, "[ClientBridge] Connect: json.Unmarshal failed: "+err.Error())
-		c.state.Store("failed: config error")
+		failAndCleanup("[ClientBridge] Connect: json.Unmarshal failed: " + err.Error())
 		return
 	}
 	goLogger(1, "[ClientBridge] Connect: JSON config parsed successfully.")
@@ -118,8 +133,7 @@ func (c *ClientBridge) Connect() {
 	goLogger(1, fmt.Sprintf("[ClientBridge] Connect: Resolving UDP address for %s.", jc.Server))
 	rAddr, err := net.ResolveUDPAddr("udp", jc.Server)
 	if err != nil {
-		goLogger(2, "[ClientBridge] Connect: net.ResolveUDPAddr failed: "+err.Error())
-		c.state.Store("failed: dns error")
+		failAndCleanup("[ClientBridge] Connect: net.ResolveUDPAddr failed: " + err.Error())
 		return
 	}
 	goLogger(1, fmt.Sprintf("[ClientBridge] Connect: Resolved to %s.", rAddr.String()))
@@ -129,8 +143,7 @@ func (c *ClientBridge) Connect() {
 		goLogger(1, "[ClientBridge] Connect: PSK found, creating Salamander obfuscator.")
 		ob, err := obfs.NewSalamanderObfuscator([]byte(jc.PSK))
 		if err != nil {
-			goLogger(2, "[ClientBridge] Connect: NewSalamanderObfuscator failed: "+err.Error())
-			c.state.Store("failed: obfs error")
+			failAndCleanup("[ClientBridge] Connect: NewSalamanderObfuscator failed: " + err.Error())
 			return
 		}
 		connFactory = &obfsFactory{Obfs: ob}
@@ -153,8 +166,7 @@ func (c *ClientBridge) Connect() {
 	goLogger(1, "[ClientBridge] Connect: Calling hy.NewClient (this may block).")
 	client, handshakeInfo, err := hy.NewClient(cfg)
 	if err != nil {
-		goLogger(2, "[ClientBridge] Connect: hy.NewClient failed: "+err.Error())
-		c.state.Store("failed: " + err.Error())
+		failAndCleanup("[ClientBridge] Connect: hy.NewClient failed: " + err.Error())
 		return
 	}
 	goLogger(0, fmt.Sprintf("[ClientBridge] Connect: Control plane connected. UDPEnabled: %t.", handshakeInfo.UDPEnabled))
@@ -163,9 +175,8 @@ func (c *ClientBridge) Connect() {
 	goLogger(1, "[ClientBridge] Connect: Warming up data path by dialing 1.1.1.1:53.")
 	testConn, err := client.TCP("1.1.1.1:53")
 	if err != nil {
-		goLogger(2, "[ClientBridge] Connect: Data path warm-up failed: "+err.Error())
-		c.state.Store("failed: data path warm-up error")
-		_ = client.Close()
+		failAndCleanup("[ClientBridge] Connect: Data path warm-up failed: " + err.Error())
+		_ = client.Close() // 确保关闭部分成功的连接
 		return
 	}
 	_ = testConn.Close()
@@ -175,8 +186,7 @@ func (c *ClientBridge) Connect() {
 		goLogger(1, "[ClientBridge] Connect: UDP enabled, calling client.UDP().")
 		udpConn, err := client.UDP()
 		if err != nil {
-			goLogger(2, "[ClientBridge] Connect: client.UDP() failed: "+err.Error())
-			c.state.Store("failed: udp setup error")
+			failAndCleanup("[ClientBridge] Connect: client.UDP() failed: " + err.Error())
 			_ = client.Close()
 			return
 		}
@@ -191,6 +201,8 @@ func (c *ClientBridge) Connect() {
 	goLogger(0, "[ClientBridge] Connect: Setup complete. State changed to 'connected'.")
 	c.state.Store("connected")
 }
+
+// ===================== MODIFICATION END (CRITICAL FIX) =====================
 
 func (c *ClientBridge) GetState() string {
 	return c.state.Load().(string)

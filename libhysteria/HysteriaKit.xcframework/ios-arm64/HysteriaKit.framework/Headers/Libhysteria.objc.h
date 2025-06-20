@@ -41,6 +41,10 @@
 - (nonnull instancetype)initWithRef:(_Nonnull id)ref;
 - (nonnull instancetype)init;
 - (BOOL)close:(NSError* _Nullable* _Nullable)error;
+/**
+ * ==================== MODIFICATION START (CRITICAL FIX) ====================
+MARK: - CORRECTED (Robust connection with self-cleanup on failure)
+ */
 - (void)connect;
 - (NSString* _Nonnull)getState;
 - (BOOL)readToTun:(NSData* _Nullable)out_ ret0_:(long* _Nullable)ret0_ error:(NSError* _Nullable* _Nullable)error;
