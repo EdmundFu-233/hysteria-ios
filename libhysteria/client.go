@@ -68,7 +68,7 @@ func newClientBridge(raw string) (*ClientBridge, error) {
 	cb := &ClientBridge{
 		// ==================== MODIFICATION START (PERFORMANCE) ====================
 		// 减小通道缓冲区大小，以降低基线内存占用。
-		inboundUDPQ: make(chan *InboundUDPPacket, 2048),
+		inboundUDPQ: make(chan *InboundUDPPacket, 1024),
 		// ===================== MODIFICATION END (PERFORMANCE) =====================
 		rawConfig: raw,
 	}
